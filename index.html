@@ -27,24 +27,173 @@
         input, textarea { -webkit-user-select: text; user-select: text; }
       }
       #avvio {
-        position: fixed; inset: 0; display: flex; align-items: center;
-        justify-content: center; font-family: system-ui, sans-serif;
-        color: #8FA0B0; font-size: 15px;
+        position: fixed; inset: 0; padding: 28px 22px;
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 14px; line-height: 1.6; color: #8FA0B0;
+        overflow-y: auto; -webkit-user-select: text; user-select: text;
       }
+      #avvio h1 { font-size: 17px; color: #E9EEF3; margin: 0 0 16px; font-weight: 600; }
+      #avvio .riga { display: flex; gap: 8px; margin-bottom: 4px; }
+      #avvio .riga b { color: #E9EEF3; font-weight: 500; }
+      #avvio .ok { color: #4FA96B; }
+      #avvio .ko { color: #D95C55; }
+      #avvio .dettaglio {
+        margin-top: 18px; padding: 12px 14px; border-left: 3px solid #D95C55;
+        background: #1B2128; color: #E9EEF3; font-size: 13px;
+        white-space: pre-wrap; word-break: break-word;
+      }
+      #avvio .aiuto { margin-top: 14px; font-size: 13px; }
     </style>
   </head>
   <body>
     <div id="root"></div>
-    <div id="avvio">Avvio di Gimmo…</div>
 
-    <!-- VERSIONE DI PROVA.
-         React e il traduttore del codice arrivano da internet e il codice
-         viene tradotto ogni volta che apri la pagina: comodo per provare
-         subito, ma lento all'avvio e inutilizzabile senza rete.
-         La versione definitiva si costruisce con Vite (cartella progetto). -->
-    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+    <div id="avvio">
+      <h1>Avvio di Gimmo</h1>
+      <div id="passi"></div>
+      <div id="dettaglio"></div>
+    </div>
+
+    <!-- ------------------------------------------------------------------
+         VERSIONE DI PROVA.
+         React e il traduttore del codice vengono scaricati da internet a ogni
+         apertura: comoda per provare subito, lenta all'avvio e inutilizzabile
+         senza rete. La versione definitiva si costruisce con Vite.
+
+         Il caricamento è scritto a mano invece di usare semplici tag <script>
+         per un motivo solo: se qualcosa non arriva, deve dirlo a schermo.
+         Una pagina che resta bianca non si può riparare a distanza.
+         ------------------------------------------------------------------ -->
+    <script>
+      (function () {
+        var passi = document.getElementById("passi");
+        var dettaglio = document.getElementById("dettaglio");
+        var finito = false;
+
+        function segna(testo) {
+          var d = document.createElement("div");
+          d.className = "riga";
+          d.innerHTML = '<b>' + testo + '</b><span class="stato">…</span>';
+          passi.appendChild(d);
+          return d.querySelector(".stato");
+        }
+
+        function errore(titolo, dettagliTecnici, aiuto) {
+          if (finito) return;
+          finito = true;
+          dettaglio.innerHTML =
+            '<div class="dettaglio"><b>' + titolo + '</b>\n\n' + (dettagliTecnici || "") + "</div>" +
+            (aiuto ? '<div class="aiuto">' + aiuto + "</div>" : "");
+        }
+
+        // Ogni libreria ha più indirizzi: se il primo non risponde si prova il
+        // successivo. Le versioni sono fissate di proposito — "l'ultima
+        // disponibile" è una variabile che non controlliamo.
+        var LIBRERIE = [
+          {
+            nome: "React",
+            controlla: function () { return typeof window.React !== "undefined"; },
+            url: [
+              "https://unpkg.com/react@18.3.1/umd/react.production.min.js",
+              "https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"
+            ]
+          },
+          {
+            nome: "React DOM",
+            controlla: function () { return typeof window.ReactDOM !== "undefined"; },
+            url: [
+              "https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js",
+              "https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"
+            ]
+          },
+          {
+            nome: "Traduttore del codice",
+            controlla: function () { return typeof window.Babel !== "undefined"; },
+            url: [
+              "https://unpkg.com/@babel/standalone@7.24.7/babel.min.js",
+              "https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js",
+              "https://unpkg.com/@babel/standalone/babel.min.js"
+            ]
+          }
+        ];
+
+        function carica(lib, indice, stato, poi) {
+          if (indice >= lib.url.length) {
+            stato.textContent = "non arrivato";
+            stato.className = "stato ko";
+            errore(
+              "Non riesco a scaricare " + lib.nome + ".",
+              "Indirizzi provati:\n" + lib.url.join("\n"),
+              "Quasi sempre è la connessione. Prova così, in ordine:<br>" +
+                "1. controlla di essere online<br>" +
+                "2. passa dal Wi-Fi ai dati (o viceversa)<br>" +
+                "3. se sei sulla rete della palestra o dell'ufficio, potrebbe bloccare questi indirizzi: prova con i dati del telefono"
+            );
+            return;
+          }
+          var s = document.createElement("script");
+          s.src = lib.url[indice];
+          s.async = false;
+          s.onload = function () {
+            if (!lib.controlla()) {
+              carica(lib, indice + 1, stato, poi);
+              return;
+            }
+            stato.textContent = "ok";
+            stato.className = "stato ok";
+            poi();
+          };
+          s.onerror = function () { carica(lib, indice + 1, stato, poi); };
+          document.head.appendChild(s);
+        }
+
+        function prossima(i) {
+          if (i >= LIBRERIE.length) return avvia();
+          var lib = LIBRERIE[i];
+          var stato = segna("Scarico " + lib.nome);
+          carica(lib, 0, stato, function () { prossima(i + 1); });
+        }
+
+        function avvia() {
+          var stato = segna("Preparo l'app");
+          try {
+            // Babel cerca da solo i blocchi di codice da tradurre, ma solo se
+            // è già presente quando la pagina finisce di caricarsi. Qui arriva
+            // dopo, quindi glielo si chiede a mano.
+            window.Babel.transformScriptTags();
+            stato.textContent = "ok";
+            stato.className = "stato ok";
+          } catch (e) {
+            stato.textContent = "errore";
+            stato.className = "stato ko";
+            errore(
+              "Il codice di Gimmo non è stato tradotto correttamente.",
+              String((e && e.message) || e),
+              "Questo è un errore nel file: mandami il testo qui sopra."
+            );
+          }
+        }
+
+        window.addEventListener("error", function (ev) {
+          var m = ev && ev.message ? ev.message : "errore sconosciuto";
+          var dove = ev && ev.lineno ? "\n\nriga " + ev.lineno : "";
+          errore("Gimmo si è fermato durante l'avvio.", m + dove, "Mandami il testo qui sopra.");
+        });
+
+        // Se dopo 25 secondi non è successo niente, meglio dirlo.
+        setTimeout(function () {
+          if (!document.getElementById("root").firstChild) {
+            errore(
+              "L'avvio sta impiegando troppo.",
+              "Le librerie pesano circa 3 MB: con una connessione lenta può volerci un minuto.",
+              "Aspetta ancora un po'. Se non cambia nulla, ricarica la pagina stando sotto Wi-Fi."
+            );
+          }
+        }, 25000);
+
+        prossima(0);
+      })();
+    </script>
 
     <script type="text/babel" data-presets="react">
       const { useState, useEffect, useRef, useCallback, useMemo } = React;
@@ -2527,9 +2676,19 @@
         margin: "0 0 12px",
       };
 
-      const avvio = document.getElementById("avvio");
-      if (avvio) avvio.remove();
-      ReactDOM.createRoot(document.getElementById("root")).render(<Gimmo />);
+      const schermataAvvio = document.getElementById("avvio");
+      try {
+        ReactDOM.createRoot(document.getElementById("root")).render(<Gimmo />);
+        if (schermataAvvio) schermataAvvio.remove();
+      } catch (e) {
+        const d = document.getElementById("dettaglio");
+        if (d) {
+          d.innerHTML =
+            '<div class="dettaglio"><b>Gimmo non è riuscito ad aprirsi.</b>\n\n' +
+            String((e && e.stack) || e) +
+            "</div>";
+        }
+      }
     </script>
   </body>
 </html>
