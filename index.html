@@ -1,0 +1,2535 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#12161B" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Gimmo" />
+    <title>Gimmo</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" />
+    <style>
+      :root { color-scheme: dark; }
+      html, body, #root { height: 100%; }
+      body {
+        margin: 0;
+        background: #12161b;
+        color: #e9eef3;
+        overscroll-behavior: none;
+        -webkit-text-size-adjust: 100%;
+      }
+      @media (display-mode: standalone) {
+        body { -webkit-user-select: none; user-select: none; }
+        input, textarea { -webkit-user-select: text; user-select: text; }
+      }
+      #avvio {
+        position: fixed; inset: 0; display: flex; align-items: center;
+        justify-content: center; font-family: system-ui, sans-serif;
+        color: #8FA0B0; font-size: 15px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="avvio">Avvio di Gimmo…</div>
+
+    <!-- VERSIONE DI PROVA.
+         React e il traduttore del codice arrivano da internet e il codice
+         viene tradotto ogni volta che apri la pagina: comodo per provare
+         subito, ma lento all'avvio e inutilizzabile senza rete.
+         La versione definitiva si costruisce con Vite (cartella progetto). -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+
+    <script type="text/babel" data-presets="react">
+      const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+      /* ------------------------------------------------------------------ *
+       * Gimmo — tracker allenamenti
+       * Dati salvati localmente e persistenti tra le sessioni.
+       * ------------------------------------------------------------------ */
+
+      const DATA_KEY = "gimmo:data:v1";
+      const ACTIVE_KEY = "gimmo:active:v1";
+      const QUARANTINE_PREFIX = "gimmo:illeggibile:";
+
+      // Versione della forma dei dati salvati, non dell'app.
+      // Va alzata solo quando cambia la struttura di esercizi/schede/sessioni,
+      // e ogni salto va gestito in migrate(): lo storico di un utente non si butta.
+      const SCHEMA_VERSION = 1;
+
+      const emptyData = () => ({
+        schemaVersion: SCHEMA_VERSION,
+        exercises: [],
+        routines: [],
+        sessions: [],
+      });
+
+      const C = {
+        bg: "#12161B",
+        surface: "#1B2128",
+        surface2: "#232C36",
+        line: "#333E4A",
+        text: "#E9EEF3",
+        muted: "#8FA0B0",
+        blue: "#2A72E0",
+        yellow: "#F2B441",
+        green: "#4FA96B",
+        red: "#D95C55",
+      };
+
+      const uid = () => Math.random().toString(36).slice(2, 10);
+      const todayISO = () => new Date().toISOString();
+
+      function fmtClock(ms) {
+        const s = Math.max(0, Math.round(ms / 1000));
+        return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+      }
+      function fmtRest(sec) {
+        if (sec == null) return "—";
+        if (sec < 60) return `${sec}s`;
+        const m = Math.floor(sec / 60);
+        const r = sec % 60;
+        return r ? `${m}′${String(r).padStart(2, "0")}` : `${m}′`;
+      }
+      function fmtDate(iso) {
+        const d = new Date(iso);
+        return d.toLocaleDateString("it-IT", { day: "numeric", month: "short", year: "numeric" });
+      }
+      function fmtDateShort(iso) {
+        return new Date(iso).toLocaleDateString("it-IT", { day: "2-digit", month: "2-digit" });
+      }
+
+      /* ----------------------------- persistenza ---------------------------- *
+       * Gimmo deve girare in ambienti diversi (anteprima, browser, in futuro app
+       * nativa) e in ognuno il posto dove salvare cambia. Qui sotto c'è un solo
+       * punto di contatto con lo spazio di archiviazione: il resto dell'app non sa
+       * e non deve sapere dove finiscono i dati.
+       * Regola guida: un allenamento registrato non si perde e non si sovrascrive
+       * mai in silenzio. Se qualcosa non torna, i salvataggi si fermano e l'utente
+       * lo viene a sapere.
+       * -------------------------------------------------------------------- */
+
+      const memoryStore = new Map();
+
+      const store = (() => {
+        // 1. Ambiente di anteprima: espone window.storage.
+        if (typeof window !== "undefined" && window.storage && typeof window.storage.get === "function") {
+          return {
+            kind: "preview",
+            durable: true,
+            get: async (k) => {
+              const r = await window.storage.get(k);
+              return r && r.value != null ? r.value : null;
+            },
+            set: async (k, v) => {
+              await window.storage.set(k, v);
+            },
+            remove: async (k) => {
+              await window.storage.delete(k);
+            },
+            list: async (prefix) => {
+              const r = await window.storage.list(prefix);
+              return r && Array.isArray(r.keys) ? r.keys : [];
+            },
+          };
+        }
+
+        // 2. Browser normale. La scrittura di prova non è superflua: in navigazione
+        //    privata su Safari localStorage esiste ma scrivere lancia un errore, e
+        //    scoprirlo adesso è meglio che scoprirlo a metà allenamento.
+        try {
+          if (typeof window !== "undefined" && window.localStorage) {
+            const probe = "gimmo:prova";
+            window.localStorage.setItem(probe, "1");
+            window.localStorage.removeItem(probe);
+            return {
+              kind: "browser",
+              durable: true,
+              get: async (k) => window.localStorage.getItem(k),
+              set: async (k, v) => window.localStorage.setItem(k, v),
+              remove: async (k) => window.localStorage.removeItem(k),
+              list: async (prefix) => {
+                const out = [];
+                for (let i = 0; i < window.localStorage.length; i++) {
+                  const k = window.localStorage.key(i);
+                  if (k && k.startsWith(prefix)) out.push(k);
+                }
+                return out;
+              },
+            };
+          }
+        } catch (e) {
+          /* non disponibile: si scende al livello successivo */
+        }
+
+        // 3. Nessuno spazio scrivibile. L'app funziona comunque, ma i dati vivono
+        //    solo finché la pagina resta aperta: durable a false accende l'avviso.
+        return {
+          kind: "memoria",
+          durable: false,
+          get: async (k) => (memoryStore.has(k) ? memoryStore.get(k) : null),
+          set: async (k, v) => {
+            memoryStore.set(k, v);
+          },
+          remove: async (k) => {
+            memoryStore.delete(k);
+          },
+          list: async (prefix) => [...memoryStore.keys()].filter((k) => k.startsWith(prefix)),
+        };
+      })();
+
+      // Legge una chiave distinguendo i tre casi che contano:
+      // vuota (primo avvio), leggibile, illeggibile (dato corrotto).
+      // La differenza non è accademica: su "vuota" si può scrivere, su
+      // "illeggibile" no, altrimenti il salvataggio automatico cancella lo storico.
+      async function readRecord(key) {
+        let raw = null;
+        try {
+          raw = await store.get(key);
+        } catch (e) {
+          // window.storage.get solleva un errore quando la chiave non esiste
+          // invece di restituire null: al primo avvio questo è il percorso normale.
+          return { status: "vuoto" };
+        }
+        if (raw == null || raw === "") return { status: "vuoto" };
+        try {
+          return { status: "ok", value: JSON.parse(raw), raw };
+        } catch (e) {
+          return { status: "illeggibile", raw };
+        }
+      }
+
+      async function writeRecord(key, value) {
+        try {
+          await store.set(key, JSON.stringify(value));
+          return { ok: true };
+        } catch (e) {
+          const pieno =
+            e &&
+            (e.name === "QuotaExceededError" ||
+              e.name === "NS_ERROR_DOM_QUOTA_REACHED" ||
+              e.code === 22);
+          console.error("gimmo: salvataggio fallito", store.kind, e);
+          return { ok: false, reason: pieno ? "spazio" : "scrittura" };
+        }
+      }
+
+      // Mette da parte una copia grezza del dato illeggibile prima di qualunque
+      // altra operazione. Non serve all'app: serve a poter recuperare a mano.
+      async function quarantine(raw) {
+        try {
+          await store.set(QUARANTINE_PREFIX + Date.now(), raw);
+        } catch (e) {
+          /* se non si riesce nemmeno a metterlo da parte, pazienza: non si scrive comunque */
+        }
+      }
+
+      // Porta un dato salvato da una versione precedente alla forma corrente.
+      // Oggi c'è un solo salto (schema assente → 1); la struttura a catena serve
+      // perché i salti futuri si aggiungano senza toccare quelli vecchi.
+      function migrate(stored) {
+        if (!stored || typeof stored !== "object" || Array.isArray(stored)) {
+          return { ok: false, reason: "formato" };
+        }
+        let d = stored;
+        let v = typeof d.schemaVersion === "number" ? d.schemaVersion : 0;
+
+        if (v === 0) {
+          d = { ...d, schemaVersion: 1 };
+          v = 1;
+        }
+        // if (v === 1) { d = migraA2(d); v = 2; }
+
+        if (v > SCHEMA_VERSION) {
+          // Dati scritti da una versione più recente di Gimmo: leggerli male e
+          // risalvarli significherebbe rovinarli. Meglio fermarsi.
+          return { ok: false, reason: "futuro" };
+        }
+
+        // Un campo assente è normale (archivio nuovo, o scritto da una versione che
+        // ancora non lo aveva) e vale lista vuota. Un campo presente ma del tipo
+        // sbagliato no: è il segno che il dato è rovinato, e azzerarlo in silenzio
+        // vorrebbe dire cancellare lo storico. In quel caso ci si ferma.
+        const campi = {};
+        for (const nome of ["exercises", "routines", "sessions"]) {
+          const v = d[nome];
+          if (v === undefined || v === null) campi[nome] = [];
+          else if (Array.isArray(v)) campi[nome] = v;
+          else return { ok: false, reason: "formato" };
+        }
+
+        return { ok: true, data: { schemaVersion: SCHEMA_VERSION, ...campi } };
+      }
+
+      // Unico punto di ingresso al caricamento dell'archivio.
+      // Restituisce anche se è lecito scrivere: chi chiama non deve ragionarci.
+      async function loadArchive() {
+        const rec = await readRecord(DATA_KEY);
+
+        if (rec.status === "vuoto") {
+          return { data: emptyData(), writable: true, issue: null };
+        }
+        if (rec.status === "illeggibile") {
+          await quarantine(rec.raw);
+          return { data: emptyData(), writable: false, issue: "illeggibile" };
+        }
+
+        const m = migrate(rec.value);
+        if (!m.ok) {
+          if (m.reason !== "futuro") await quarantine(rec.raw);
+          return { data: emptyData(), writable: false, issue: m.reason === "futuro" ? "futuro" : "illeggibile" };
+        }
+        return { data: m.data, writable: true, issue: null };
+      }
+
+      // La sessione in corso è un dato di comodo, non l'archivio: se è rovinata si
+      // scarta e si riparte, senza bloccare i salvataggi dello storico.
+      async function loadActive() {
+        const rec = await readRecord(ACTIVE_KEY);
+        if (rec.status !== "ok") return null;
+        const a = rec.value;
+        return a && a.session && Array.isArray(a.session.entries) ? a : null;
+      }
+
+      /* ------------------------------- backup ------------------------------ *
+       * Il backup non è una funzione accessoria: è l'unica cosa che rende
+       * sopportabile un cambio di telefono, una cache svuotata da Safari o un
+       * archivio finito in quarantena. Il file è leggibile a occhio di proposito,
+       * così resta recuperabile anche senza Gimmo.
+       * -------------------------------------------------------------------- */
+
+      const EXPORT_FORMAT = 1;
+      const ROLLBACK_PREFIX = "gimmo:prima-del-ripristino:";
+
+      function buildExport(data) {
+        return {
+          app: "gimmo",
+          exportFormat: EXPORT_FORMAT,
+          exportedAt: todayISO(),
+          data: { ...data, schemaVersion: SCHEMA_VERSION },
+        };
+      }
+
+      function exportFilename(d = new Date()) {
+        const p = (n) => String(n).padStart(2, "0");
+        return `gimmo-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.json`;
+      }
+
+      // Accetta sia il file di backup completo sia l'archivio nudo: chi apre il file
+      // e ne incolla un pezzo non deve essere punito per questo.
+      function parseBackup(text) {
+        let parsed;
+        try {
+          parsed = JSON.parse(text);
+        } catch (e) {
+          return { ok: false, reason: "json" };
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          return { ok: false, reason: "json" };
+        }
+        if (parsed.app && parsed.app !== "gimmo") return { ok: false, reason: "altra-app" };
+        if (typeof parsed.exportFormat === "number" && parsed.exportFormat > EXPORT_FORMAT) {
+          return { ok: false, reason: "futuro" };
+        }
+        const payload = parsed.data && typeof parsed.data === "object" ? parsed.data : parsed;
+        const m = migrate(payload);
+        if (!m.ok) return { ok: false, reason: m.reason };
+        return { ok: true, data: m.data, exportedAt: typeof parsed.exportedAt === "string" ? parsed.exportedAt : null };
+      }
+
+      // Il confronto tra nomi deve perdonare quello che perdona l'occhio: spazi
+      // doppi, maiuscole, apostrofi tipografici. "Panca  piana" e "panca piana"
+      // sono lo stesso esercizio per chi si allena, e devono esserlo anche qui.
+      const normName = (s) =>
+        String(s || "")
+          .replace(/[\u2018\u2019\u02BC]/g, "'")
+          .replace(/\s+/g, " ")
+          .trim()
+          .toLowerCase();
+
+      // Unisce due archivi senza creare doppioni. Il caso che conta davvero:
+      // stesso esercizio creato su due telefoni con id diversi ma stesso nome.
+      // Se non lo si gestisse, dopo un'unione ci si ritroverebbe due "Panca piana"
+      // con lo storico spezzato a metà — il modo più veloce per far disinstallare l'app.
+      function mergeArchives(current, incoming) {
+        const exercises = [...current.exercises];
+        const byId = new Map(exercises.map((e) => [e.id, e]));
+        const byName = new Map(exercises.map((e) => [normName(e.name), e]));
+        const remap = new Map();
+        let nuoviEsercizi = 0;
+
+        for (const e of incoming.exercises) {
+          if (!e || !e.id) continue;
+          if (byId.has(e.id)) {
+            remap.set(e.id, e.id);
+            continue;
+          }
+          const omonimo = byName.get(normName(e.name));
+          if (omonimo) {
+            remap.set(e.id, omonimo.id);
+            continue;
+          }
+          exercises.push(e);
+          byId.set(e.id, e);
+          byName.set(normName(e.name), e);
+          remap.set(e.id, e.id);
+          nuoviEsercizi += 1;
+        }
+
+        const fix = (id) => remap.get(id) || id;
+
+        const routines = [...current.routines];
+        const routineIds = new Set(routines.map((r) => r.id));
+        let nuoveSchede = 0;
+        for (const r of incoming.routines) {
+          if (!r || !r.id || routineIds.has(r.id)) continue;
+          routines.push({ ...r, items: (r.items || []).map((it) => ({ ...it, exerciseId: fix(it.exerciseId) })) });
+          routineIds.add(r.id);
+          nuoveSchede += 1;
+        }
+
+        const sessions = [...current.sessions];
+        const sessionIds = new Set(sessions.map((s) => s.id));
+        let nuoviAllenamenti = 0;
+        for (const s of incoming.sessions) {
+          if (!s || !s.id || sessionIds.has(s.id)) continue;
+          sessions.push({ ...s, entries: (s.entries || []).map((en) => ({ ...en, exerciseId: fix(en.exerciseId) })) });
+          sessionIds.add(s.id);
+          nuoviAllenamenti += 1;
+        }
+
+        sessions.sort((a, b) => new Date(a.startedAt) - new Date(b.startedAt));
+
+        return {
+          data: { schemaVersion: SCHEMA_VERSION, exercises, routines, sessions },
+          added: { exercises: nuoviEsercizi, routines: nuoveSchede, sessions: nuoviAllenamenti },
+        };
+      }
+
+      // Prima di sovrascrivere l'archivio con un ripristino si mette via com'era.
+      // Costa una scrittura e vale un ripensamento.
+      async function saveRollback(data) {
+        try {
+          await store.set(ROLLBACK_PREFIX + Date.now(), JSON.stringify(buildExport(data)));
+        } catch (e) {
+          /* non blocca il ripristino */
+        }
+      }
+
+      async function listSalvataggiDiEmergenza() {
+        const raccolta = [];
+        for (const [prefix, tipo] of [
+          [QUARANTINE_PREFIX, "illeggibile"],
+          [ROLLBACK_PREFIX, "prima-del-ripristino"],
+        ]) {
+          let keys = [];
+          try {
+            keys = await store.list(prefix);
+          } catch (e) {
+            keys = [];
+          }
+          for (const k of keys) {
+            const ts = Number(k.slice(prefix.length));
+            raccolta.push({ key: k, tipo, at: Number.isFinite(ts) ? ts : null });
+          }
+        }
+        return raccolta.sort((a, b) => (b.at || 0) - (a.at || 0));
+      }
+
+      async function readRaw(key) {
+        try {
+          return await store.get(key);
+        } catch (e) {
+          return null;
+        }
+      }
+
+      async function removeKey(key) {
+        try {
+          await store.remove(key);
+          return true;
+        } catch (e) {
+          return false;
+        }
+      }
+
+      /* Salvataggio del file. Su iPhone il foglio di condivisione è l'unico modo
+       * affidabile per far finire un file dentro l'app File o su iCloud; il download
+       * classico resta per il desktop; il testo da copiare è la rete sotto la rete. */
+      async function saveTextAsFile(filename, text) {
+        const blob = new Blob([text], { type: "application/json" });
+
+        try {
+          if (typeof File !== "undefined" && navigator.canShare) {
+            const file = new File([blob], filename, { type: "application/json" });
+            if (navigator.canShare({ files: [file] })) {
+              await navigator.share({ files: [file], title: filename });
+              return { ok: true, via: "condivisione" };
+            }
+          }
+        } catch (e) {
+          if (e && e.name === "AbortError") return { ok: true, via: "annullato" };
+        }
+
+        try {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 2000);
+          return { ok: true, via: "download" };
+        } catch (e) {
+          return { ok: false };
+        }
+      }
+
+      async function copyText(text) {
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+            return true;
+          }
+        } catch (e) {
+          /* si prova la via vecchia */
+        }
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand("copy");
+          ta.remove();
+          return ok;
+        } catch (e) {
+          return false;
+        }
+      }
+
+      /* ---------------------------- statistiche ---------------------------- */
+
+      function setVolume(s) {
+        if (s.w == null || s.r == null) return 0;
+        return s.w * s.r;
+      }
+
+      function exerciseStats(sessions, exerciseId) {
+        const points = [];
+        let best = null;
+        let bestSet = null;
+        let totalSets = 0;
+        for (const ses of sessions) {
+          for (const en of ses.entries) {
+            if (en.exerciseId !== exerciseId || en.sets.length === 0) continue;
+            let top = null;
+            let vol = 0;
+            for (const s of en.sets) {
+              totalSets += 1;
+              vol += setVolume(s);
+              if (s.w != null && (top == null || s.w > top)) top = s.w;
+              if (s.w != null && (best == null || s.w > best)) {
+                best = s.w;
+                bestSet = { ...s, date: ses.startedAt };
+              }
+            }
+            points.push({ date: ses.startedAt, top, vol, reps: en.sets.length });
+          }
+        }
+        points.sort((a, b) => new Date(a.date) - new Date(b.date));
+        return { points, best, bestSet, totalSets, sessions: points.length };
+      }
+
+      function lastPerformance(sessions, exerciseId) {
+        const ordered = [...sessions].sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
+        for (const ses of ordered) {
+          for (const en of ses.entries) {
+            if (en.exerciseId === exerciseId && en.sets.length) {
+              return { date: ses.startedAt, sets: en.sets };
+            }
+          }
+        }
+        return null;
+      }
+
+      /* ------------------------------ atomi UI ----------------------------- */
+
+      function Btn({ children, onClick, tone = "ghost", size = "md", style, disabled, ...rest }) {
+        const tones = {
+          primary: { background: C.blue, color: "#fff", border: `1px solid ${C.blue}` },
+          ghost: { background: C.surface2, color: C.text, border: `1px solid ${C.line}` },
+          quiet: { background: "transparent", color: C.muted, border: "1px solid transparent" },
+          danger: { background: "transparent", color: C.red, border: `1px solid ${C.line}` },
+          go: { background: C.green, color: "#08130C", border: `1px solid ${C.green}` },
+        };
+        const sizes = {
+          sm: { padding: "6px 10px", fontSize: 13, borderRadius: 8 },
+          md: { padding: "10px 14px", fontSize: 15, borderRadius: 10 },
+          lg: { padding: "16px 18px", fontSize: 17, borderRadius: 12 },
+        };
+        return (
+          <button
+            onClick={onClick}
+            disabled={disabled}
+            style={{
+              ...tones[tone],
+              ...sizes[size],
+              fontWeight: 600,
+              fontFamily: "inherit",
+              cursor: disabled ? "default" : "pointer",
+              opacity: disabled ? 0.4 : 1,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 8,
+              lineHeight: 1.1,
+              ...style,
+            }}
+            {...rest}
+          >
+            {children}
+          </button>
+        );
+      }
+
+      function Field({ label, children }) {
+        return (
+          <label style={{ display: "block", marginBottom: 14 }}>
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 6 }}>{label}</div>
+            {children}
+          </label>
+        );
+      }
+
+      function Input(props) {
+        return (
+          <input
+            {...props}
+            style={{
+              width: "100%",
+              background: C.bg,
+              border: `1px solid ${C.line}`,
+              color: C.text,
+              borderRadius: 10,
+              padding: "12px 12px",
+              fontSize: 16,
+              fontFamily: "inherit",
+              outline: "none",
+              boxSizing: "border-box",
+              ...props.style,
+            }}
+          />
+        );
+      }
+
+      function Stepper({ value, onChange, step = 1, min = 0, suffix = "", decimals = 0, width = 92 }) {
+        const dec = () => onChange(Math.max(min, +(value - step).toFixed(2)));
+        const inc = () => onChange(+(value + step).toFixed(2));
+        return (
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <button onClick={dec} aria-label="riduci" style={stepBtn}>
+              −
+            </button>
+            <div
+              style={{
+                width,
+                textAlign: "center",
+                fontFamily: "'Barlow Condensed', sans-serif",
+                fontSize: 30,
+                fontWeight: 600,
+                fontVariantNumeric: "tabular-nums",
+                color: C.text,
+                lineHeight: 1,
+              }}
+            >
+              {decimals ? value.toFixed(decimals).replace(/\.0$/, "") : value}
+              <span style={{ fontSize: 14, color: C.muted, marginLeft: 3 }}>{suffix}</span>
+            </div>
+            <button onClick={inc} aria-label="aumenta" style={stepBtn}>
+              +
+            </button>
+          </div>
+        );
+      }
+      const miniBtn = {
+        width: 34,
+        height: 34,
+        borderRadius: 8,
+        background: C.surface2,
+        border: `1px solid ${C.line}`,
+        color: C.text,
+        fontSize: 16,
+        fontWeight: 500,
+        cursor: "pointer",
+        fontFamily: "inherit",
+        flexShrink: 0,
+        lineHeight: 1,
+      };
+
+      const stepBtn = {
+        width: 44,
+        height: 44,
+        borderRadius: 10,
+        background: C.surface2,
+        border: `1px solid ${C.line}`,
+        color: C.text,
+        fontSize: 22,
+        fontWeight: 500,
+        cursor: "pointer",
+        fontFamily: "inherit",
+        flexShrink: 0,
+      };
+
+      function Sheet({ open, onClose, title, children }) {
+        if (!open) return null;
+        return (
+          <div
+            onClick={onClose}
+            style={{
+              position: "fixed",
+              inset: 0,
+              background: "rgba(6,9,12,.72)",
+              zIndex: 60,
+              display: "flex",
+              alignItems: "flex-end",
+              justifyContent: "center",
+            }}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                background: C.surface,
+                borderTop: `1px solid ${C.line}`,
+                borderRadius: "16px 16px 0 0",
+                width: "100%",
+                maxWidth: 520,
+                maxHeight: "86vh",
+                overflowY: "auto",
+                padding: "18px 18px 28px",
+                boxSizing: "border-box",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                <h2 style={{ margin: 0, fontSize: 19, fontWeight: 600 }}>{title}</h2>
+                <Btn tone="quiet" size="sm" onClick={onClose}>
+                  Chiudi
+                </Btn>
+              </div>
+              {children}
+            </div>
+          </div>
+        );
+      }
+
+      function Sparkline({ points, valueKey }) {
+        const vals = points.map((p) => p[valueKey]).filter((v) => v != null && v > 0);
+        if (vals.length < 2) return null;
+        const w = 260;
+        const h = 54;
+        const min = Math.min(...vals);
+        const max = Math.max(...vals);
+        const span = max - min || 1;
+        const coords = vals.map((v, i) => {
+          const x = (i / (vals.length - 1)) * (w - 6) + 3;
+          const y = h - 6 - ((v - min) / span) * (h - 14);
+          return [x, y];
+        });
+        const d = coords.map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+        const [lx, ly] = coords[coords.length - 1];
+        return (
+          <svg viewBox={`0 0 ${w} ${h}`} width="100%" height={h} style={{ display: "block" }}>
+            <path d={d} fill="none" stroke={C.blue} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            <circle cx={lx} cy={ly} r="3.5" fill={C.yellow} />
+          </svg>
+        );
+      }
+
+      /* --------------------- avviso stato archiviazione --------------------- *
+       * Se i dati non si stanno salvando, l'utente deve saperlo mentre si allena,
+       * non scoprirlo la settimana dopo. Deliberatamente non si può chiudere.
+       * -------------------------------------------------------------------- */
+
+      const PERSISTENCE_MESSAGES = {
+        volatile: {
+          tone: "warn",
+          title: "Gli allenamenti non vengono salvati",
+          body: "Su questo dispositivo l'archivio non è disponibile: quello che registri sparisce chiudendo la pagina. Salva un backup da Storico › Backup prima di chiudere, e se stai usando la navigazione privata riapri Gimmo in una finestra normale.",
+        },
+        illeggibile: {
+          tone: "stop",
+          title: "Archivio non leggibile",
+          body: "I dati salvati sono danneggiati e i salvataggi restano sospesi per non sovrascriverli. Vai su Storico › Backup: trovi la copia messa da parte, e da lì puoi ripristinare un backup o ripartire da zero.",
+        },
+        futuro: {
+          tone: "stop",
+          title: "Archivio di una versione più recente",
+          body: "I dati salvati arrivano da una versione più recente di Gimmo. I salvataggi sono sospesi per non danneggiarli: aggiorna l'app e riapri.",
+        },
+        spazio: {
+          tone: "stop",
+          title: "Spazio esaurito",
+          body: "Non c'è più spazio per salvare. Libera spazio sul dispositivo, poi registra una serie per riprovare.",
+        },
+        scrittura: {
+          tone: "warn",
+          title: "Ultimo salvataggio non riuscito",
+          body: "Le ultime serie potrebbero non essere state salvate. Registrane un'altra per forzare un nuovo tentativo, e intanto salva un backup da Storico › Backup.",
+        },
+      };
+
+      function PersistenceNotice({ issue }) {
+        const msg = issue ? PERSISTENCE_MESSAGES[issue] : null;
+        if (!msg) return null;
+        const accent = msg.tone === "stop" ? C.red : C.yellow;
+        return (
+          <div
+            role="status"
+            style={{
+              borderLeft: `3px solid ${accent}`,
+              background: C.surface,
+              padding: "12px 14px 13px",
+              margin: "0 0 2px",
+            }}
+          >
+            <div style={{ fontSize: 14, fontWeight: 600, color: accent, marginBottom: 3 }}>{msg.title}</div>
+            <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.45 }}>{msg.body}</div>
+          </div>
+        );
+      }
+
+      /* ------------------------------ App root ----------------------------- */
+
+      function Gimmo() {
+        const [loaded, setLoaded] = useState(false);
+        const [data, setData] = useState(emptyData);
+        const [active, setActive] = useState(null); // { session, timer }
+        const [tab, setTab] = useState("allena");
+        const [now, setNow] = useState(Date.now());
+        // writable dice se è lecito scrivere sull'archivio; issue è il motivo da
+        // mostrare quando non lo è (o quando lo spazio non è duraturo).
+        const [persistence, setPersistence] = useState({
+          writable: true,
+          issue: store.durable ? null : "volatile",
+        });
+        const audioRef = useRef(null);
+        const firedRef = useRef(false);
+
+        useEffect(() => {
+          let annullato = false;
+          (async () => {
+            const archive = await loadArchive();
+            const a = await loadActive();
+            if (annullato) return;
+            setData(archive.data);
+            if (a) setActive(a);
+            setPersistence((p) => ({
+              writable: archive.writable,
+              issue: archive.issue || p.issue,
+            }));
+            setLoaded(true);
+          })();
+          return () => {
+            annullato = true;
+          };
+        }, []);
+
+        // I salvataggi sono ritardati di qualche centinaio di millisecondi: durante
+        // una serie lo stato cambia a raffica e serializzare tutto l'archivio a ogni
+        // tocco fa scattare il telefono. Il ritardo sull'archivio è più lungo, quello
+        // sulla sessione in corso più corto: è il dato che protegge da un'app chiusa
+        // per sbaglio a metà allenamento.
+        useEffect(() => {
+          if (!loaded || !persistence.writable) return;
+          const id = setTimeout(async () => {
+            const res = await writeRecord(DATA_KEY, data);
+            if (!res.ok) setPersistence((p) => ({ ...p, issue: res.reason }));
+          }, 400);
+          return () => clearTimeout(id);
+        }, [data, loaded, persistence.writable]);
+
+        useEffect(() => {
+          if (!loaded || !persistence.writable) return;
+          const id = setTimeout(() => {
+            writeRecord(ACTIVE_KEY, active);
+          }, 150);
+          return () => clearTimeout(id);
+        }, [active, loaded, persistence.writable]);
+
+        // Il ritardo di cui sopra apre una finestra di mezzo secondo in cui l'ultima
+        // serie non è ancora sul disco. Su iPhone l'app può essere chiusa dal sistema
+        // appena passa in secondo piano, quindi lì il salvataggio va forzato subito.
+        const latest = useRef({ data, active });
+        useEffect(() => {
+          latest.current = { data, active };
+        }, [data, active]);
+
+        useEffect(() => {
+          if (!loaded || !persistence.writable) return;
+          const flush = () => {
+            if (document.visibilityState === "visible") return;
+            writeRecord(DATA_KEY, latest.current.data);
+            writeRecord(ACTIVE_KEY, latest.current.active);
+          };
+          // pagehide copre la chiusura della scheda, dove visibilitychange su Safari
+          // non è affidabile.
+          const onPageHide = () => {
+            writeRecord(DATA_KEY, latest.current.data);
+            writeRecord(ACTIVE_KEY, latest.current.active);
+          };
+          document.addEventListener("visibilitychange", flush);
+          window.addEventListener("pagehide", onPageHide);
+          return () => {
+            document.removeEventListener("visibilitychange", flush);
+            window.removeEventListener("pagehide", onPageHide);
+          };
+        }, [loaded, persistence.writable]);
+
+        const timer = active?.timer || null;
+
+        // Il countdown si calcola sull'orario di fine: resta corretto anche
+        // se l'app va in secondo piano o cambi schermata.
+        useEffect(() => {
+          if (!timer) return;
+          const id = setInterval(() => setNow(Date.now()), 250);
+          const onVis = () => setNow(Date.now());
+          document.addEventListener("visibilitychange", onVis);
+          return () => {
+            clearInterval(id);
+            document.removeEventListener("visibilitychange", onVis);
+          };
+        }, [timer]);
+
+        const remaining = timer ? timer.endsAt - now : 0;
+
+        useEffect(() => {
+          if (!timer) {
+            firedRef.current = false;
+            return;
+          }
+          if (remaining <= 0 && !firedRef.current) {
+            firedRef.current = true;
+            beep();
+            try {
+              navigator.vibrate && navigator.vibrate([220, 90, 220]);
+            } catch (e) {}
+          }
+          if (remaining > 0) firedRef.current = false;
+        }, [remaining, timer]);
+
+        const beep = useCallback(() => {
+          try {
+            if (!audioRef.current) {
+              const Ctx = window.AudioContext || window.webkitAudioContext;
+              audioRef.current = new Ctx();
+            }
+            const ctx = audioRef.current;
+            if (ctx.state === "suspended") ctx.resume();
+            [0, 0.28].forEach((offset) => {
+              const o = ctx.createOscillator();
+              const g = ctx.createGain();
+              o.type = "sine";
+              o.frequency.value = 880;
+              g.gain.setValueAtTime(0.0001, ctx.currentTime + offset);
+              g.gain.exponentialRampToValueAtTime(0.35, ctx.currentTime + offset + 0.02);
+              g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + offset + 0.22);
+              o.connect(g).connect(ctx.destination);
+              o.start(ctx.currentTime + offset);
+              o.stop(ctx.currentTime + offset + 0.24);
+            });
+          } catch (e) {}
+        }, []);
+
+        const primeAudio = useCallback(() => {
+          try {
+            if (!audioRef.current) {
+              const Ctx = window.AudioContext || window.webkitAudioContext;
+              audioRef.current = new Ctx();
+            }
+            if (audioRef.current.state === "suspended") audioRef.current.resume();
+          } catch (e) {}
+        }, []);
+
+        /* ----------------------------- mutazioni ---------------------------- */
+
+        const addExercise = (name) => {
+          const clean = name.trim();
+          if (!clean) return null;
+          const existing = data.exercises.find((e) => e.name.toLowerCase() === clean.toLowerCase());
+          if (existing) return existing.id;
+          const ex = { id: uid(), name: clean, createdAt: todayISO() };
+          setData((d) => ({ ...d, exercises: [...d.exercises, ex] }));
+          return ex.id;
+        };
+        const renameExercise = (id, name) =>
+          setData((d) => ({ ...d, exercises: d.exercises.map((e) => (e.id === id ? { ...e, name } : e)) }));
+        const deleteExercise = (id) =>
+          setData((d) => ({ ...d, exercises: d.exercises.filter((e) => e.id !== id) }));
+
+        const saveRoutine = (routine) =>
+          setData((d) => {
+            const exists = d.routines.some((r) => r.id === routine.id);
+            return {
+              ...d,
+              routines: exists ? d.routines.map((r) => (r.id === routine.id ? routine : r)) : [...d.routines, routine],
+            };
+          });
+        const deleteRoutine = (id) => setData((d) => ({ ...d, routines: d.routines.filter((r) => r.id !== id) }));
+
+        const startSession = (routine) => {
+          primeAudio();
+          const session = {
+            id: uid(),
+            startedAt: todayISO(),
+            endedAt: null,
+            routineId: routine ? routine.id : null,
+            name: routine ? routine.name : "Allenamento libero",
+            entries: routine
+              ? routine.items.map((it) => ({
+                  id: uid(),
+                  exerciseId: it.exerciseId,
+                  mode: it.mode,
+                  targetSets: it.sets,
+                  targetReps: it.reps,
+                  targetDuration: it.duration,
+                  rest: it.rest,
+                  sets: [],
+                }))
+              : [],
+          };
+          setActive({ session, timer: null });
+          setTab("allena");
+        };
+
+        const updateSession = (fn) => setActive((a) => (a ? { ...a, session: fn(a.session) } : a));
+
+        const startRest = (seconds, label) => {
+          primeAudio();
+          setActive((a) => (a ? { ...a, timer: { endsAt: Date.now() + seconds * 1000, total: seconds, label } } : a));
+          setNow(Date.now());
+        };
+        const adjustRest = (delta) =>
+          setActive((a) =>
+            a && a.timer
+              ? {
+                  ...a,
+                  timer: {
+                    ...a.timer,
+                    endsAt: Math.max(Date.now(), a.timer.endsAt + delta * 1000),
+                    total: Math.max(5, a.timer.total + delta),
+                  },
+                }
+              : a
+          );
+        const stopRest = () => setActive((a) => (a ? { ...a, timer: null } : a));
+
+        const finishSession = () => {
+          if (!active) return;
+          const s = active.session;
+          const kept = { ...s, endedAt: todayISO(), entries: s.entries.filter((e) => e.sets.length > 0) };
+          if (kept.entries.length) setData((d) => ({ ...d, sessions: [...d.sessions, kept] }));
+          setActive(null);
+          setTab(kept.entries.length ? "storico" : "allena");
+        };
+        const discardSession = () => setActive(null);
+
+        // Il ripristino non passa dal salvataggio ritardato: scrive subito e riporta
+        // l'esito, perché è l'unica operazione in cui l'utente ha il diritto di
+        // sapere con certezza se è andata a buon fine. Mette anche da parte
+        // l'archivio precedente, così un ripensamento resta possibile.
+        const restoreArchive = async (nuovo) => {
+          await saveRollback(data);
+          const res = await writeRecord(DATA_KEY, nuovo);
+          if (!res.ok) {
+            setPersistence((p) => ({ ...p, issue: res.reason }));
+            return { ok: false };
+          }
+          setData(nuovo);
+          setPersistence({ writable: true, issue: store.durable ? null : "volatile" });
+          return { ok: true };
+        };
+
+        // Via d'uscita quando l'archivio è illeggibile e i salvataggi sono fermi:
+        // senza questa, l'app resterebbe in sola lettura per sempre.
+        const resetArchive = async () => {
+          const vuoto = emptyData();
+          const res = await writeRecord(DATA_KEY, vuoto);
+          if (!res.ok) {
+            setPersistence((p) => ({ ...p, issue: res.reason }));
+            return { ok: false };
+          }
+          setData(vuoto);
+          setPersistence({ writable: true, issue: store.durable ? null : "volatile" });
+          return { ok: true };
+        };
+
+        const exName = useCallback(
+          (id) => data.exercises.find((e) => e.id === id)?.name || "Esercizio",
+          [data.exercises]
+        );
+
+        if (!loaded) {
+          return (
+            <div className="gimmo-shell" style={{ ...shell, minHeight: "100vh", alignItems: "center", justifyContent: "center", display: "flex" }}>
+              <span style={{ color: C.muted }}>Carico i tuoi dati…</span>
+            </div>
+          );
+        }
+
+        return (
+          <div className="gimmo-shell" style={shell}>
+            <style>{`
+              @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
+              /* 100dvh segue la barra del browser mentre compare e scompare;
+                 100vh resta per i browser che non la conoscono. L'ordine conta:
+                 chi non capisce la seconda riga tiene la prima. */
+              .gimmo-shell { height: 100vh; height: 100dvh; }
+              .gimmo-scroll { overscroll-behavior: contain; }
+              * { -webkit-tap-highlight-color: transparent; }
+              button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid ${C.yellow}; outline-offset: 2px; }
+              input::placeholder, textarea::placeholder { color: ${C.muted}; opacity: .7; }
+              @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+            `}</style>
+
+            <div className="gimmo-scroll" style={{ flex: 1, overflowY: "auto", paddingBottom: timer ? 168 : 96 }}>
+              <PersistenceNotice issue={persistence.issue} />
+              {tab === "allena" && (
+                <TrainView
+                  data={data}
+                  active={active}
+                  exName={exName}
+                  addExercise={addExercise}
+                  startSession={startSession}
+                  updateSession={updateSession}
+                  startRest={startRest}
+                  finishSession={finishSession}
+                  discardSession={discardSession}
+                />
+              )}
+              {tab === "schede" && (
+                <RoutinesView
+                  data={data}
+                  exName={exName}
+                  addExercise={addExercise}
+                  saveRoutine={saveRoutine}
+                  deleteRoutine={deleteRoutine}
+                  startSession={startSession}
+                  hasActive={!!active}
+                />
+              )}
+              {tab === "esercizi" && (
+                <ExercisesView
+                  data={data}
+                  addExercise={addExercise}
+                  renameExercise={renameExercise}
+                  deleteExercise={deleteExercise}
+                />
+              )}
+              {tab === "storico" && (
+                <HistoryView
+                  data={data}
+                  exName={exName}
+                  persistence={persistence}
+                  sessionInCorso={!!active}
+                  onRestore={restoreArchive}
+                  onReset={resetArchive}
+                />
+              )}
+            </div>
+
+            {timer && (
+              <RestBar
+                remaining={remaining}
+                timer={timer}
+                onAdjust={adjustRest}
+                onStop={stopRest}
+              />
+            )}
+
+            <nav
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(4, 1fr)",
+                borderTop: `1px solid ${C.line}`,
+                background: C.surface,
+                // Su iPhone senza tasto fisico la barra di sistema copre il fondo
+                // dello schermo: senza questo, "Storico" finisce sotto la lineetta.
+                paddingBottom: "env(safe-area-inset-bottom, 0px)",
+              }}
+            >
+              {[
+                ["allena", "Allena"],
+                ["schede", "Schede"],
+                ["esercizi", "Esercizi"],
+                ["storico", "Storico"],
+              ].map(([key, label]) => (
+                <button
+                  key={key}
+                  onClick={() => setTab(key)}
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    borderTop: `2px solid ${tab === key ? C.yellow : "transparent"}`,
+                    color: tab === key ? C.text : C.muted,
+                    padding: "14px 4px 18px",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    fontFamily: "inherit",
+                    cursor: "pointer",
+                  }}
+                >
+                  {label}
+                  {key === "allena" && active ? (
+                    <span style={{ color: C.green, marginLeft: 5, fontSize: 16, lineHeight: 0 }}>•</span>
+                  ) : null}
+                </button>
+              ))}
+            </nav>
+          </div>
+        );
+      }
+
+      const shell = {
+        fontFamily: "'Inter', system-ui, -apple-system, sans-serif",
+        background: C.bg,
+        color: C.text,
+        // L'altezza sta nella classe .gimmo-shell qui sotto e non qui: da uno stile
+        // inline non si può scrivere una regola con ripiego, e su iPhone 100vh è
+        // sbagliata (conta anche la barra del browser, così il fondo finisce
+        // sotto lo schermo). Serve 100dvh con 100vh come riserva.
+        display: "flex",
+        flexDirection: "column",
+        maxWidth: 520,
+        margin: "0 auto",
+        overflow: "hidden",
+        // Lascia respirare la tacca e la barra laterale in orizzontale.
+        paddingTop: "env(safe-area-inset-top, 0px)",
+        paddingLeft: "env(safe-area-inset-left, 0px)",
+        paddingRight: "env(safe-area-inset-right, 0px)",
+        boxSizing: "border-box",
+      };
+
+      /* --------------------------- barra recupero -------------------------- */
+
+      function RestBar({ remaining, timer, onAdjust, onStop }) {
+        const done = remaining <= 0;
+        const pct = Math.max(0, Math.min(1, remaining / (timer.total * 1000)));
+        return (
+          <div
+            style={{
+              borderTop: `1px solid ${done ? C.green : C.line}`,
+              background: done ? "#16281D" : C.surface,
+              padding: "12px 16px 14px",
+            }}
+          >
+            <div style={{ height: 3, background: C.surface2, borderRadius: 2, marginBottom: 10, overflow: "hidden" }}>
+              <div
+                style={{
+                  width: `${pct * 100}%`,
+                  height: "100%",
+                  background: done ? C.green : C.yellow,
+                  transition: "width .25s linear",
+                }}
+              />
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div
+                  style={{
+                    fontFamily: "'Barlow Condensed', sans-serif",
+                    fontSize: 44,
+                    fontWeight: 700,
+                    lineHeight: 0.95,
+                    letterSpacing: "0.01em",
+                    fontVariantNumeric: "tabular-nums",
+                    color: done ? C.green : C.text,
+                  }}
+                >
+                  {done ? "Vai" : fmtClock(remaining)}
+                </div>
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: C.muted,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
+                  {done ? "Recupero finito" : `Recupero · ${timer.label}`}
+                </div>
+              </div>
+              <Btn size="sm" onClick={() => onAdjust(-15)} aria-label="meno 15 secondi">
+                −15s
+              </Btn>
+              <Btn size="sm" onClick={() => onAdjust(15)} aria-label="più 15 secondi">
+                +15s
+              </Btn>
+              <Btn size="sm" tone={done ? "go" : "ghost"} onClick={onStop}>
+                {done ? "Ok" : "Salta"}
+              </Btn>
+            </div>
+          </div>
+        );
+      }
+
+      /* ------------------------------- Allena ------------------------------ */
+
+      function TrainView(props) {
+        const { data, active } = props;
+        if (!active) return <StartPanel {...props} />;
+        return <LiveSession {...props} />;
+      }
+
+      function StartPanel({ data, startSession }) {
+        const [lastSessions] = useMemo(
+          () => [[...data.sessions].sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt)).slice(0, 3)],
+          [data.sessions]
+        );
+        return (
+          <div style={{ padding: "26px 18px" }}>
+            <h1 style={h1}>Pronto ad allenarti</h1>
+            <p style={{ color: C.muted, marginTop: 0, marginBottom: 24, fontSize: 15, lineHeight: 1.5 }}>
+              Parti da una scheda salvata, oppure aggiungi gli esercizi mano a mano.
+            </p>
+
+            <Btn tone="primary" size="lg" style={{ width: "100%", marginBottom: 22 }} onClick={() => startSession(null)}>
+              Allenamento libero
+            </Btn>
+
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 10 }}>Le tue schede</div>
+            {data.routines.length === 0 ? (
+              <div style={emptyBox}>Nessuna scheda ancora. Creane una dalla sezione Schede.</div>
+            ) : (
+              data.routines.map((r) => (
+                <button key={r.id} onClick={() => startSession(r)} style={rowCard}>
+                  <div>
+                    <div style={{ fontSize: 16, fontWeight: 600 }}>{r.name}</div>
+                    <div style={{ fontSize: 13, color: C.muted, marginTop: 3 }}>
+                      {r.items.length} eserciz{r.items.length === 1 ? "io" : "i"}
+                    </div>
+                  </div>
+                  <span style={{ color: C.blue, fontSize: 14, fontWeight: 600 }}>Inizia</span>
+                </button>
+              ))
+            )}
+
+            {lastSessions.length > 0 && (
+              <>
+                <div style={{ fontSize: 13, color: C.muted, margin: "26px 0 10px" }}>Ultimi allenamenti</div>
+                {lastSessions.map((s) => (
+                  <div key={s.id} style={{ ...rowCard, cursor: "default" }}>
+                    <div>
+                      <div style={{ fontSize: 15, fontWeight: 500 }}>{s.name}</div>
+                      <div style={{ fontSize: 13, color: C.muted, marginTop: 3 }}>{fmtDate(s.startedAt)}</div>
+                    </div>
+                    <span style={{ fontSize: 13, color: C.muted }}>
+                      {s.entries.reduce((n, e) => n + e.sets.length, 0)} serie
+                    </span>
+                  </div>
+                ))}
+              </>
+            )}
+          </div>
+        );
+      }
+
+      function LiveSession({ data, active, exName, addExercise, updateSession, startRest, finishSession, discardSession }) {
+        const s = active.session;
+        const [openId, setOpenId] = useState(s.entries[0]?.id || null);
+        const [adding, setAdding] = useState(false);
+        const [confirmEnd, setConfirmEnd] = useState(false);
+
+        const elapsed = Date.now() - new Date(s.startedAt).getTime();
+
+        const addEntry = (exerciseId, rest = 90) => {
+          const entry = {
+            id: uid(),
+            exerciseId,
+            mode: "reps",
+            targetSets: null,
+            targetReps: null,
+            targetDuration: null,
+            rest,
+            sets: [],
+          };
+          updateSession((ses) => ({ ...ses, entries: [...ses.entries, entry] }));
+          setOpenId(entry.id);
+          setAdding(false);
+        };
+
+        const patchEntry = (id, patch) =>
+          updateSession((ses) => ({
+            ...ses,
+            entries: ses.entries.map((e) => (e.id === id ? { ...e, ...patch } : e)),
+          }));
+
+        const totalSets = s.entries.reduce((n, e) => n + e.sets.length, 0);
+
+        return (
+          <div style={{ padding: "20px 16px 8px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 18 }}>
+              <div style={{ minWidth: 0 }}>
+                <h1 style={{ ...h1, marginBottom: 4 }}>{s.name}</h1>
+                <div style={{ color: C.muted, fontSize: 13 }}>
+                  {fmtClock(elapsed)} · {totalSets} serie
+                </div>
+              </div>
+              <Btn size="sm" onClick={() => setConfirmEnd(true)}>
+                Termina
+              </Btn>
+            </div>
+
+            {s.entries.length === 0 && (
+              <div style={emptyBox}>Aggiungi il primo esercizio per iniziare a registrare le serie.</div>
+            )}
+
+            {s.entries.map((entry, i) => (
+              <EntryCard
+                key={entry.id}
+                index={i + 1}
+                entry={entry}
+                name={exName(entry.exerciseId)}
+                open={openId === entry.id}
+                onToggle={() => setOpenId(openId === entry.id ? null : entry.id)}
+                onPatch={(p) => patchEntry(entry.id, p)}
+                startRest={startRest}
+                history={lastPerformance(data.sessions, entry.exerciseId)}
+              />
+            ))}
+
+            <Btn size="lg" style={{ width: "100%", marginTop: 14 }} onClick={() => setAdding(true)}>
+              + Aggiungi esercizio
+            </Btn>
+
+            <AddExerciseSheet
+              open={adding}
+              onClose={() => setAdding(false)}
+              exercises={data.exercises}
+              sessions={data.sessions}
+              onPick={(id) => addEntry(id)}
+              onCreate={(name) => {
+                const id = addExercise(name);
+                if (id) addEntry(id);
+              }}
+            />
+
+            <Sheet open={confirmEnd} onClose={() => setConfirmEnd(false)} title="Terminare l'allenamento?">
+              <p style={{ color: C.muted, fontSize: 15, lineHeight: 1.5, marginTop: 0 }}>
+                Le serie registrate finiscono nello storico. Gli esercizi senza serie non vengono salvati.
+              </p>
+              <Btn tone="primary" size="lg" style={{ width: "100%", marginBottom: 10 }} onClick={finishSession}>
+                Salva e termina
+              </Btn>
+              <Btn tone="danger" size="md" style={{ width: "100%" }} onClick={discardSession}>
+                Annulla l'allenamento senza salvare
+              </Btn>
+            </Sheet>
+          </div>
+        );
+      }
+
+      function EntryCard({ index, entry, name, open, onToggle, onPatch, startRest, history }) {
+        const lastSet = entry.sets[entry.sets.length - 1];
+        const historyLast = history?.sets?.[history.sets.length - 1];
+        const seed = lastSet || historyLast || {};
+        const [w, setW] = useState(seed.w ?? 0);
+        const [r, setR] = useState(seed.r ?? entry.targetReps ?? 10);
+        const [editRest, setEditRest] = useState(false);
+
+        useEffect(() => {
+          if (lastSet) {
+            setW(lastSet.w ?? 0);
+            setR(lastSet.r ?? r);
+          }
+        }, [entry.sets.length]);
+
+        const logSet = (weight, reps) => {
+          const set = { w: weight > 0 ? weight : null, r: reps > 0 ? reps : null, at: todayISO() };
+          onPatch({ sets: [...entry.sets, set] });
+          if (entry.rest) startRest(entry.rest, name);
+        };
+
+        const target =
+          entry.mode === "time"
+            ? entry.targetDuration
+              ? `${entry.targetDuration}s`
+              : null
+            : entry.targetSets
+            ? `${entry.targetSets}×${entry.targetReps ?? "—"}`
+            : null;
+
+        const doneCount = entry.sets.length;
+        const complete = entry.targetSets && doneCount >= entry.targetSets;
+
+        return (
+          <div
+            style={{
+              background: C.surface,
+              border: `1px solid ${open ? C.line : "#262E37"}`,
+              borderRadius: 14,
+              marginBottom: 10,
+              overflow: "hidden",
+            }}
+          >
+            <button
+              onClick={onToggle}
+              style={{
+                display: "flex",
+                width: "100%",
+                alignItems: "center",
+                gap: 12,
+                background: "transparent",
+                border: "none",
+                color: C.text,
+                padding: "14px 14px",
+                cursor: "pointer",
+                textAlign: "left",
+                fontFamily: "inherit",
+              }}
+            >
+              <span
+                style={{
+                  fontFamily: "'Barlow Condensed', sans-serif",
+                  fontSize: 26,
+                  fontWeight: 600,
+                  color: complete ? C.green : C.muted,
+                  width: 22,
+                  flexShrink: 0,
+                  fontVariantNumeric: "tabular-nums",
+                }}
+              >
+                {index}
+              </span>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: "block", fontSize: 16, fontWeight: 600 }}>{name}</span>
+                <span style={{ display: "block", fontSize: 13, color: C.muted, marginTop: 2 }}>
+                  {target ? `${target} · ` : ""}rec {fmtRest(entry.rest)}
+                  {doneCount ? ` · ${doneCount} fatte` : ""}
+                </span>
+              </span>
+              <span style={{ color: C.muted, fontSize: 13 }}>{open ? "▾" : "▸"}</span>
+            </button>
+
+            {entry.sets.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "0 14px 12px" }}>
+                {entry.sets.map((set, i) => (
+                  <span key={i} style={chip}>
+                    <span style={{ color: C.muted, marginRight: 4 }}>{i + 1}</span>
+                    {set.w != null ? `${set.w}kg` : "corpo libero"}
+                    {set.r != null ? ` × ${set.r}` : ""}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {open && (
+              <div style={{ padding: "4px 14px 16px", borderTop: `1px solid ${C.surface2}` }}>
+                {history && (
+                  <div style={{ fontSize: 13, color: C.muted, margin: "12px 0 14px" }}>
+                    Ultima volta ({fmtDateShort(history.date)}):{" "}
+                    {history.sets
+                      .map((s) => `${s.w != null ? s.w + "kg" : "cl"}${s.r != null ? "×" + s.r : ""}`)
+                      .join(" · ")}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 18, alignItems: "center", marginBottom: 14, flexWrap: "wrap" }}>
+                  <div>
+                    <div style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>Carico (kg)</div>
+                    <Stepper value={w} onChange={setW} step={2.5} decimals={1} suffix="kg" />
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>Ripetizioni</div>
+                    <Stepper value={r} onChange={setR} step={1} width={62} />
+                  </div>
+                </div>
+
+                <Btn tone="go" size="lg" style={{ width: "100%", marginBottom: 10 }} onClick={() => logSet(w, r)}>
+                  Serie fatta{w > 0 ? ` · ${w}kg × ${r}` : ` · ${r} rip`}
+                </Btn>
+
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <Btn
+                    size="sm"
+                    disabled={!entry.sets.length}
+                    onClick={() => onPatch({ sets: entry.sets.slice(0, -1) })}
+                  >
+                    Annulla ultima serie
+                  </Btn>
+                  <Btn size="sm" onClick={() => setEditRest(true)}>
+                    Recupero {fmtRest(entry.rest)}
+                  </Btn>
+                  {entry.rest ? (
+                    <Btn size="sm" onClick={() => startRest(entry.rest, name)}>
+                      Avvia recupero
+                    </Btn>
+                  ) : null}
+                </div>
+              </div>
+            )}
+
+            <Sheet open={editRest} onClose={() => setEditRest(false)} title={`Recupero · ${name}`}>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 18 }}>
+                {[45, 60, 90, 120, 180, 240].map((v) => (
+                  <Btn
+                    key={v}
+                    size="md"
+                    tone={entry.rest === v ? "primary" : "ghost"}
+                    onClick={() => {
+                      onPatch({ rest: v });
+                      setEditRest(false);
+                    }}
+                  >
+                    {fmtRest(v)}
+                  </Btn>
+                ))}
+              </div>
+              <Field label="Valore personalizzato (secondi)">
+                <Input
+                  type="number"
+                  inputMode="numeric"
+                  defaultValue={entry.rest ?? 90}
+                  onChange={(e) => onPatch({ rest: Math.max(0, parseInt(e.target.value || "0", 10)) })}
+                />
+              </Field>
+              <Btn tone="primary" size="lg" style={{ width: "100%" }} onClick={() => setEditRest(false)}>
+                Fatto
+              </Btn>
+            </Sheet>
+          </div>
+        );
+      }
+
+      function AddExerciseSheet({ open, onClose, exercises, sessions, onPick, onCreate }) {
+        const [q, setQ] = useState("");
+        const filtered = exercises.filter((e) => e.name.toLowerCase().includes(q.trim().toLowerCase()));
+        const exact = exercises.some((e) => e.name.toLowerCase() === q.trim().toLowerCase());
+
+        const recent = useMemo(() => {
+          const seen = [];
+          const ordered = [...sessions].sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
+          for (const s of ordered) for (const e of s.entries) if (!seen.includes(e.exerciseId)) seen.push(e.exerciseId);
+          return seen.slice(0, 6);
+        }, [sessions]);
+
+        return (
+          <Sheet open={open} onClose={onClose} title="Aggiungi esercizio">
+            <Input
+              autoFocus
+              placeholder="Cerca o scrivi un nome nuovo"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              style={{ marginBottom: 14 }}
+            />
+            {q.trim() && !exact && (
+              <Btn
+                tone="primary"
+                size="lg"
+                style={{ width: "100%", marginBottom: 16 }}
+                onClick={() => {
+                  onCreate(q);
+                  setQ("");
+                }}
+              >
+                Crea “{q.trim()}”
+              </Btn>
+            )}
+            {!q && recent.length > 0 && (
+              <>
+                <div style={{ fontSize: 13, color: C.muted, marginBottom: 8 }}>Recenti</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 18 }}>
+                  {recent.map((id) => {
+                    const ex = exercises.find((e) => e.id === id);
+                    if (!ex) return null;
+                    return (
+                      <Btn key={id} size="sm" onClick={() => onPick(id)}>
+                        {ex.name}
+                      </Btn>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+            {filtered.length === 0 && !q ? (
+              <div style={emptyBox}>La libreria è vuota. Scrivi un nome qui sopra per creare il primo esercizio.</div>
+            ) : (
+              filtered.map((ex) => (
+                <button key={ex.id} onClick={() => onPick(ex.id)} style={{ ...rowCard, marginBottom: 8 }}>
+                  <span style={{ fontSize: 15, fontWeight: 500 }}>{ex.name}</span>
+                  <span style={{ color: C.blue, fontSize: 13, fontWeight: 600 }}>Aggiungi</span>
+                </button>
+              ))
+            )}
+          </Sheet>
+        );
+      }
+
+      /* ------------------------------- Schede ------------------------------ */
+
+      function RoutinesView({ data, exName, addExercise, saveRoutine, deleteRoutine, startSession, hasActive }) {
+        const [editing, setEditing] = useState(null);
+
+        if (editing) {
+          return (
+            <RoutineEditor
+              routine={editing}
+              data={data}
+              exName={exName}
+              addExercise={addExercise}
+              onSave={(r) => {
+                saveRoutine(r);
+                setEditing(null);
+              }}
+              onCancel={() => setEditing(null)}
+            />
+          );
+        }
+
+        return (
+          <div style={{ padding: "26px 18px" }}>
+            <h1 style={h1}>Schede</h1>
+            <p style={{ color: C.muted, marginTop: 0, marginBottom: 22, fontSize: 15, lineHeight: 1.5 }}>
+              Un programma che ripeti nel tempo: esercizi in ordine, serie e recuperi fissi.
+            </p>
+
+            <Btn
+              tone="primary"
+              size="lg"
+              style={{ width: "100%", marginBottom: 22 }}
+              onClick={() => setEditing({ id: uid(), name: "", items: [] })}
+            >
+              Nuova scheda
+            </Btn>
+
+            {data.routines.length === 0 ? (
+              <div style={emptyBox}>Nessuna scheda salvata.</div>
+            ) : (
+              data.routines.map((r) => (
+                <div key={r.id} style={{ ...cardBox, marginBottom: 12 }}>
+                  <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 4 }}>{r.name || "Senza nome"}</div>
+                  <div style={{ fontSize: 13, color: C.muted, marginBottom: 12 }}>
+                    {r.items.map((it, i) => `${i + 1}. ${exName(it.exerciseId)}`).join("  ")}
+                  </div>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <Btn size="sm" tone="primary" disabled={hasActive} onClick={() => startSession(r)}>
+                      Inizia
+                    </Btn>
+                    <Btn size="sm" onClick={() => setEditing(JSON.parse(JSON.stringify(r)))}>
+                      Modifica
+                    </Btn>
+                    <Btn size="sm" tone="danger" onClick={() => deleteRoutine(r.id)}>
+                      Elimina
+                    </Btn>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        );
+      }
+
+      function RoutineEditor({ routine, data, exName, addExercise, onSave, onCancel }) {
+        const [name, setName] = useState(routine.name);
+        const [items, setItems] = useState(routine.items);
+        const [adding, setAdding] = useState(false);
+
+        const addItem = (exerciseId) => {
+          setItems((it) => [
+            ...it,
+            { id: uid(), exerciseId, mode: "reps", sets: 3, reps: 10, duration: 60, rest: 90 },
+          ]);
+          setAdding(false);
+        };
+        const patch = (id, p) => setItems((it) => it.map((x) => (x.id === id ? { ...x, ...p } : x)));
+        const remove = (id) => setItems((it) => it.filter((x) => x.id !== id));
+        const move = (i, dir) =>
+          setItems((it) => {
+            const j = i + dir;
+            if (j < 0 || j >= it.length) return it;
+            const copy = [...it];
+            [copy[i], copy[j]] = [copy[j], copy[i]];
+            return copy;
+          });
+
+        return (
+          <div style={{ padding: "22px 18px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+              <h1 style={{ ...h1, marginBottom: 0 }}>{routine.name ? "Modifica scheda" : "Nuova scheda"}</h1>
+              <Btn size="sm" tone="quiet" onClick={onCancel}>
+                Annulla
+              </Btn>
+            </div>
+
+            <Field label="Nome della scheda">
+              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Es. Full body A" />
+            </Field>
+
+            <div style={{ fontSize: 13, color: C.muted, margin: "18px 0 10px" }}>Esercizi</div>
+
+            {items.length === 0 && <div style={emptyBox}>Aggiungi il primo esercizio della scheda.</div>}
+
+            {items.map((it, i) => (
+              <div key={it.id} style={{ ...cardBox, marginBottom: 10 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+                  <span
+                    style={{
+                      fontFamily: "'Barlow Condensed', sans-serif",
+                      fontSize: 24,
+                      fontWeight: 600,
+                      color: C.muted,
+                      width: 20,
+                      fontVariantNumeric: "tabular-nums",
+                    }}
+                  >
+                    {i + 1}
+                  </span>
+                  <span style={{ flex: 1, fontSize: 16, fontWeight: 600 }}>{exName(it.exerciseId)}</span>
+                  <button onClick={() => move(i, -1)} style={miniBtn} aria-label="sposta su">
+                    ↑
+                  </button>
+                  <button onClick={() => move(i, 1)} style={miniBtn} aria-label="sposta giù">
+                    ↓
+                  </button>
+                  <button onClick={() => remove(it.id)} style={{ ...miniBtn, color: C.red }} aria-label="rimuovi">
+                    ×
+                  </button>
+                </div>
+
+                <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                  {[
+                    ["reps", "Serie × rip"],
+                    ["time", "A tempo"],
+                  ].map(([m, label]) => (
+                    <Btn key={m} size="sm" tone={it.mode === m ? "primary" : "ghost"} onClick={() => patch(it.id, { mode: m })}>
+                      {label}
+                    </Btn>
+                  ))}
+                </div>
+
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  {it.mode === "reps" ? (
+                    <>
+                      <SmallNum label="Serie" value={it.sets} onChange={(v) => patch(it.id, { sets: v })} />
+                      <SmallNum label="Ripetizioni" value={it.reps} onChange={(v) => patch(it.id, { reps: v })} />
+                    </>
+                  ) : (
+                    <SmallNum label="Durata (s)" value={it.duration} onChange={(v) => patch(it.id, { duration: v })} />
+                  )}
+                  <SmallNum label="Recupero (s)" value={it.rest} onChange={(v) => patch(it.id, { rest: v })} />
+                </div>
+              </div>
+            ))}
+
+            <Btn size="lg" style={{ width: "100%", marginTop: 12 }} onClick={() => setAdding(true)}>
+              + Aggiungi esercizio
+            </Btn>
+
+            <Btn
+              tone="primary"
+              size="lg"
+              style={{ width: "100%", marginTop: 20 }}
+              disabled={!name.trim() || items.length === 0}
+              onClick={() => onSave({ ...routine, name: name.trim(), items })}
+            >
+              Salva scheda
+            </Btn>
+
+            <AddExerciseSheet
+              open={adding}
+              onClose={() => setAdding(false)}
+              exercises={data.exercises}
+              sessions={data.sessions}
+              onPick={addItem}
+              onCreate={(n) => {
+                const id = addExercise(n);
+                if (id) addItem(id);
+              }}
+            />
+          </div>
+        );
+      }
+
+      function SmallNum({ label, value, onChange }) {
+        return (
+          <label style={{ display: "block" }}>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 5 }}>{label}</div>
+            <input
+              type="number"
+              inputMode="numeric"
+              value={value ?? ""}
+              onChange={(e) => onChange(e.target.value === "" ? null : Math.max(0, parseInt(e.target.value, 10)))}
+              style={{
+                width: 92,
+                background: C.bg,
+                border: `1px solid ${C.line}`,
+                color: C.text,
+                borderRadius: 9,
+                padding: "9px 10px",
+                fontSize: 16,
+                fontFamily: "inherit",
+                outline: "none",
+                boxSizing: "border-box",
+              }}
+            />
+          </label>
+        );
+      }
+
+      /* ------------------------------ Esercizi ----------------------------- */
+
+      function ExercisesView({ data, addExercise, renameExercise, deleteExercise }) {
+        const [name, setName] = useState("");
+        const [detail, setDetail] = useState(null);
+
+        const submit = () => {
+          if (!name.trim()) return;
+          addExercise(name);
+          setName("");
+        };
+
+        if (detail) {
+          const ex = data.exercises.find((e) => e.id === detail);
+          if (ex)
+            return (
+              <ExerciseDetail
+                ex={ex}
+                sessions={data.sessions}
+                onBack={() => setDetail(null)}
+                onRename={renameExercise}
+                onDelete={(id) => {
+                  deleteExercise(id);
+                  setDetail(null);
+                }}
+              />
+            );
+        }
+
+        const sorted = [...data.exercises].sort((a, b) => a.name.localeCompare(b.name, "it"));
+
+        return (
+          <div style={{ padding: "26px 18px" }}>
+            <h1 style={h1}>Esercizi</h1>
+            <p style={{ color: C.muted, marginTop: 0, marginBottom: 20, fontSize: 15, lineHeight: 1.5 }}>
+              In archivio serve solo il nome. Carichi, ripetizioni e recuperi si decidono nella scheda o durante
+              l'allenamento.
+            </p>
+
+            <div style={{ display: "flex", gap: 8, marginBottom: 24 }}>
+              <Input
+                value={name}
+                placeholder="Nome dell'esercizio"
+                onChange={(e) => setName(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && submit()}
+              />
+              <Btn tone="primary" size="md" onClick={submit} disabled={!name.trim()} style={{ flexShrink: 0 }}>
+                Aggiungi
+              </Btn>
+            </div>
+
+            {sorted.length === 0 ? (
+              <div style={emptyBox}>Nessun esercizio in archivio.</div>
+            ) : (
+              sorted.map((ex) => {
+                const st = exerciseStats(data.sessions, ex.id);
+                return (
+                  <button key={ex.id} onClick={() => setDetail(ex.id)} style={{ ...rowCard, marginBottom: 8 }}>
+                    <span>
+                      <span style={{ display: "block", fontSize: 16, fontWeight: 500 }}>{ex.name}</span>
+                      <span style={{ display: "block", fontSize: 13, color: C.muted, marginTop: 3 }}>
+                        {st.sessions ? `${st.sessions} allenamenti · massimo ${st.best ?? "—"}kg` : "mai allenato"}
+                      </span>
+                    </span>
+                    <span style={{ color: C.muted }}>›</span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        );
+      }
+
+      function ExerciseDetail({ ex, sessions, onBack, onRename, onDelete }) {
+        const st = useMemo(() => exerciseStats(sessions, ex.id), [sessions, ex.id]);
+        const [name, setName] = useState(ex.name);
+        const totalVolume = st.points.reduce((n, p) => n + p.vol, 0);
+
+        return (
+          <div style={{ padding: "22px 18px" }}>
+            <Btn size="sm" tone="quiet" onClick={onBack} style={{ marginBottom: 14, paddingLeft: 0 }}>
+              ‹ Esercizi
+            </Btn>
+
+            <Field label="Nome">
+              <Input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                onBlur={() => name.trim() && onRename(ex.id, name.trim())}
+              />
+            </Field>
+
+            <div style={{ display: "flex", gap: 10, marginTop: 22, marginBottom: 20 }}>
+              <Stat label="Allenamenti" value={st.sessions} />
+              <Stat label="Serie totali" value={st.totalSets} />
+              <Stat label="Massimo" value={st.best != null ? `${st.best}kg` : "—"} />
+            </div>
+
+            {st.points.length >= 2 ? (
+              <div style={{ ...cardBox, marginBottom: 14 }}>
+                <div style={{ fontSize: 13, color: C.muted, marginBottom: 10 }}>Carico massimo per allenamento</div>
+                <Sparkline points={st.points} valueKey="top" />
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.muted, marginTop: 6 }}>
+                  <span>{fmtDateShort(st.points[0].date)}</span>
+                  <span>{fmtDateShort(st.points[st.points.length - 1].date)}</span>
+                </div>
+              </div>
+            ) : (
+              <div style={emptyBox}>Servono almeno due allenamenti per vedere l'andamento.</div>
+            )}
+
+            {totalVolume > 0 && (
+              <div style={{ ...cardBox, marginBottom: 14 }}>
+                <div style={{ fontSize: 13, color: C.muted, marginBottom: 10 }}>Volume per allenamento (kg sollevati)</div>
+                <Sparkline points={st.points} valueKey="vol" />
+                <div style={{ fontSize: 13, color: C.muted, marginTop: 8 }}>
+                  Totale complessivo {Math.round(totalVolume).toLocaleString("it-IT")} kg
+                </div>
+              </div>
+            )}
+
+            {st.points.length > 0 && (
+              <>
+                <div style={{ fontSize: 13, color: C.muted, margin: "22px 0 10px" }}>Ultime sessioni</div>
+                {[...st.points]
+                  .reverse()
+                  .slice(0, 6)
+                  .map((p, i) => (
+                    <div key={i} style={{ ...rowCard, cursor: "default" }}>
+                      <span style={{ fontSize: 14 }}>{fmtDate(p.date)}</span>
+                      <span style={{ fontSize: 14, color: C.muted }}>
+                        {p.reps} serie{p.top != null ? ` · top ${p.top}kg` : ""}
+                      </span>
+                    </div>
+                  ))}
+              </>
+            )}
+
+            <Btn tone="danger" size="md" style={{ width: "100%", marginTop: 24 }} onClick={() => onDelete(ex.id)}>
+              Elimina esercizio
+            </Btn>
+          </div>
+        );
+      }
+
+      function Stat({ label, value }) {
+        return (
+          <div style={{ ...cardBox, flex: 1, padding: "14px 12px", textAlign: "center" }}>
+            <div
+              style={{
+                fontFamily: "'Barlow Condensed', sans-serif",
+                fontSize: 30,
+                fontWeight: 700,
+                lineHeight: 1,
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              {value}
+            </div>
+            <div style={{ fontSize: 12, color: C.muted, marginTop: 5 }}>{label}</div>
+          </div>
+        );
+      }
+
+      /* ------------------------- backup e ripristino ----------------------- */
+
+      const plur = (n, uno, molti) => `${n} ${n === 1 ? uno : molti}`;
+      const descriviArchivio = (d) =>
+        [
+          plur(d.exercises.length, "esercizio", "esercizi"),
+          plur(d.routines.length, "scheda", "schede"),
+          plur(d.sessions.length, "allenamento", "allenamenti"),
+        ].join(" · ");
+
+      const ERRORI_BACKUP = {
+        json: "Il file non è leggibile. Controlla di aver scelto un backup di Gimmo e non un altro file.",
+        "altra-app": "Questo file non è un backup di Gimmo.",
+        futuro: "Il backup arriva da una versione più recente di Gimmo. Aggiorna l'app, poi riprova.",
+        formato: "Il backup è incompleto o danneggiato: manca la struttura degli allenamenti.",
+      };
+
+      function DataSheet({ open, onClose, data, persistence, sessionInCorso, onRestore, onReset }) {
+        const [esito, setEsito] = useState(null); // { tono, testo }
+        const [incollato, setIncollato] = useState("");
+        const [pending, setPending] = useState(null); // { data, exportedAt, merge }
+        const [confermaSostituzione, setConfermaSostituzione] = useState(false);
+        const [emergenze, setEmergenze] = useState([]);
+        const fileRef = useRef(null);
+
+        // Le copie di emergenza si rileggono a ogni apertura: sono poche e conviene
+        // mostrarle aggiornate piuttosto che tenerle in memoria.
+        useEffect(() => {
+          if (!open) return;
+          let vivo = true;
+          listSalvataggiDiEmergenza().then((l) => vivo && setEmergenze(l));
+          return () => {
+            vivo = false;
+          };
+        }, [open, esito]);
+
+        const chiudi = () => {
+          setEsito(null);
+          setPending(null);
+          setIncollato("");
+          setConfermaSostituzione(false);
+          onClose();
+        };
+
+        const salvaFile = async () => {
+          const testo = JSON.stringify(buildExport(data), null, 2);
+          const r = await saveTextAsFile(exportFilename(), testo);
+          if (r.ok && r.via === "annullato") return;
+          setEsito(
+            r.ok
+              ? { tono: "ok", testo: "Backup salvato. Tienilo fuori dal telefono: una mail a te stesso basta." }
+              : { tono: "stop", testo: "Il salvataggio del file non è riuscito. Usa «Copia il testo» e incollalo dove preferisci." }
+          );
+        };
+
+        const copia = async () => {
+          const ok = await copyText(JSON.stringify(buildExport(data)));
+          setEsito(
+            ok
+              ? { tono: "ok", testo: "Backup copiato negli appunti." }
+              : { tono: "stop", testo: "La copia non è riuscita. Salva il file, oppure riprova." }
+          );
+        };
+
+        const leggiTesto = (testo) => {
+          const r = parseBackup(testo);
+          if (!r.ok) {
+            setPending(null);
+            setEsito({ tono: "stop", testo: ERRORI_BACKUP[r.reason] || ERRORI_BACKUP.formato });
+            return;
+          }
+          const unione = mergeArchives(data, r.data);
+          setEsito(null);
+          setConfermaSostituzione(false);
+          setPending({ data: r.data, exportedAt: r.exportedAt, merge: unione });
+        };
+
+        const scegliFile = async (e) => {
+          const f = e.target.files && e.target.files[0];
+          e.target.value = "";
+          if (!f) return;
+          try {
+            const testo = f.text ? await f.text() : await new Promise((res, rej) => {
+              const fr = new FileReader();
+              fr.onload = () => res(String(fr.result));
+              fr.onerror = () => rej(fr.error);
+              fr.readAsText(f);
+            });
+            leggiTesto(testo);
+          } catch (err) {
+            setEsito({ tono: "stop", testo: "Il file non si è aperto. Riprova, oppure incolla il testo del backup." });
+          }
+        };
+
+        const applica = async (nuovo, quanti) => {
+          const r = await onRestore(nuovo);
+          setPending(null);
+          setIncollato("");
+          setConfermaSostituzione(false);
+          setEsito(
+            r && r.ok
+              ? { tono: "ok", testo: `Ripristino completato: ${quanti}. La copia precedente è stata messa da parte.` }
+              : { tono: "stop", testo: "Il ripristino non è stato salvato. Controlla lo spazio sul dispositivo e riprova." }
+          );
+        };
+
+        const scaricaEmergenza = async (voce) => {
+          const raw = await readRaw(voce.key);
+          if (!raw) {
+            setEsito({ tono: "stop", testo: "La copia non è più disponibile." });
+            return;
+          }
+          const nome = `gimmo-${voce.tipo}-${voce.at || "copia"}.json`;
+          const r = await saveTextAsFile(nome, raw);
+          if (!r.ok) await copyText(raw);
+          setEsito({ tono: "ok", testo: r.ok ? "Copia salvata." : "Copia negli appunti." });
+        };
+
+        const bloccato = !!sessionInCorso;
+
+        return (
+          <Sheet open={open} onClose={chiudi} title="Backup e ripristino">
+            {esito && (
+              <div
+                style={{
+                  borderLeft: `3px solid ${esito.tono === "ok" ? C.green : C.red}`,
+                  background: C.surface2,
+                  padding: "10px 12px",
+                  fontSize: 13,
+                  lineHeight: 1.45,
+                  marginBottom: 18,
+                }}
+              >
+                {esito.testo}
+              </div>
+            )}
+
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 6 }}>Nell'archivio</div>
+            <div style={{ fontSize: 15, marginBottom: 22 }}>{descriviArchivio(data)}</div>
+
+            <div style={sezioneTitolo}>Salva una copia</div>
+            <p style={sezioneTesto}>
+              Un file di testo con tutto: esercizi, schede e allenamenti. Si apre con qualsiasi editor e si rimette
+              dentro da qui.
+            </p>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 26 }}>
+              <Btn tone="primary" size="md" onClick={salvaFile}>
+                Salva il file
+              </Btn>
+              <Btn size="md" onClick={copia}>
+                Copia il testo
+              </Btn>
+            </div>
+
+            <div style={sezioneTitolo}>Ripristina da un backup</div>
+            {bloccato ? (
+              <div style={emptyBox}>
+                C'è un allenamento in corso. Terminalo dalla scheda Allena prima di ripristinare, così le serie
+                appena registrate non vanno perse.
+              </div>
+            ) : (
+              <>
+                <p style={sezioneTesto}>
+                  Unire aggiunge solo quello che manca e non tocca nulla di esistente. Sostituire cancella l'archivio
+                  attuale e mette al suo posto il backup.
+                </p>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="application/json,.json,text/plain"
+                  style={{ display: "none" }}
+                  onChange={scegliFile}
+                />
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+                  <Btn size="md" onClick={() => fileRef.current && fileRef.current.click()}>
+                    Scegli il file
+                  </Btn>
+                </div>
+                <textarea
+                  value={incollato}
+                  onChange={(e) => setIncollato(e.target.value)}
+                  placeholder="…oppure incolla qui il testo del backup"
+                  rows={3}
+                  style={{
+                    width: "100%",
+                    background: C.bg,
+                    border: `1px solid ${C.line}`,
+                    color: C.text,
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                    // Sotto i 16px iOS ingrandisce la pagina appena tocchi il campo,
+                    // e non la rimpicciolisce più da sola.
+                    fontSize: 16,
+                    fontFamily: "inherit",
+                    outline: "none",
+                    boxSizing: "border-box",
+                    resize: "vertical",
+                    marginBottom: 10,
+                  }}
+                />
+                <Btn size="md" disabled={!incollato.trim()} onClick={() => leggiTesto(incollato)}>
+                  Leggi il testo incollato
+                </Btn>
+              </>
+            )}
+
+            {pending && !bloccato && (
+              <div style={{ ...cardBox, marginTop: 16 }}>
+                <div style={{ fontSize: 13, color: C.muted, marginBottom: 6 }}>
+                  Backup {pending.exportedAt ? `del ${fmtDate(pending.exportedAt)}` : "senza data"}
+                </div>
+                <div style={{ fontSize: 15, marginBottom: 10 }}>{descriviArchivio(pending.data)}</div>
+                <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.5, marginBottom: 14 }}>
+                  Unendolo si aggiungono {plur(pending.merge.added.sessions, "allenamento", "allenamenti")},{" "}
+                  {plur(pending.merge.added.exercises, "esercizio", "esercizi")} e{" "}
+                  {plur(pending.merge.added.routines, "scheda", "schede")}.
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <Btn
+                    tone="primary"
+                    size="md"
+                    onClick={() =>
+                      applica(
+                        pending.merge.data,
+                        `${plur(pending.merge.added.sessions, "allenamento aggiunto", "allenamenti aggiunti")}`
+                      )
+                    }
+                  >
+                    Unisci al mio archivio
+                  </Btn>
+                  {confermaSostituzione ? (
+                    <Btn
+                      tone="danger"
+                      size="md"
+                      onClick={() => applica(pending.data, `${descriviArchivio(pending.data)}`)}
+                    >
+                      Confermi? Sostituisci tutto
+                    </Btn>
+                  ) : (
+                    <Btn size="md" onClick={() => setConfermaSostituzione(true)}>
+                      Sostituisci tutto
+                    </Btn>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {emergenze.length > 0 && (
+              <>
+                <div style={{ ...sezioneTitolo, marginTop: 30 }}>Copie messe da parte</div>
+                <p style={sezioneTesto}>
+                  Gimmo salva una copia ogni volta che trova un archivio illeggibile o prima di un ripristino.
+                  Scaricale e tienile da parte: un file troncato è quasi sempre recuperabile a mano.
+                </p>
+                {emergenze.map((v) => (
+                  <div key={v.key} style={{ ...rowCard, cursor: "default" }}>
+                    <span>
+                      <span style={{ display: "block", fontSize: 14 }}>
+                        {v.tipo === "illeggibile" ? "Archivio illeggibile" : "Prima di un ripristino"}
+                      </span>
+                      <span style={{ display: "block", fontSize: 13, color: C.muted, marginTop: 2 }}>
+                        {v.at ? fmtDate(new Date(v.at).toISOString()) : "data sconosciuta"}
+                      </span>
+                    </span>
+                    <span style={{ display: "flex", gap: 6 }}>
+                      <Btn size="sm" onClick={() => scaricaEmergenza(v)}>
+                        Salva
+                      </Btn>
+                      <Btn
+                        size="sm"
+                        tone="danger"
+                        onClick={async () => {
+                          await removeKey(v.key);
+                          setEmergenze((l) => l.filter((x) => x.key !== v.key));
+                        }}
+                      >
+                        Elimina
+                      </Btn>
+                    </span>
+                  </div>
+                ))}
+              </>
+            )}
+
+            {!persistence.writable && (
+              <>
+                <div style={{ ...sezioneTitolo, marginTop: 30, color: C.red }}>Riparti da zero</div>
+                <p style={sezioneTesto}>
+                  I salvataggi sono fermi perché l'archivio non è leggibile. Dopo aver messo al sicuro la copia qui
+                  sopra, puoi svuotare l'archivio per tornare a registrare allenamenti.
+                </p>
+                <Btn
+                  tone="danger"
+                  size="md"
+                  style={{ width: "100%" }}
+                  onClick={async () => {
+                    await onReset();
+                    setEsito({ tono: "ok", testo: "Archivio svuotato. I salvataggi sono di nuovo attivi." });
+                  }}
+                >
+                  Svuota l'archivio e riattiva i salvataggi
+                </Btn>
+              </>
+            )}
+          </Sheet>
+        );
+      }
+
+      /* ------------------------------- Storico ----------------------------- */
+
+      function HistoryView({ data, exName, persistence, sessionInCorso, onRestore, onReset }) {
+        const [open, setOpen] = useState(null);
+        const [dataSheet, setDataSheet] = useState(false);
+        const sessions = [...data.sessions].sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
+
+        const weekCount = sessions.filter(
+          (s) => Date.now() - new Date(s.startedAt).getTime() < 7 * 864e5
+        ).length;
+        const monthCount = sessions.filter(
+          (s) => Date.now() - new Date(s.startedAt).getTime() < 30 * 864e5
+        ).length;
+
+        return (
+          <div style={{ padding: "26px 18px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
+              <h1 style={h1}>Storico</h1>
+              <Btn size="sm" onClick={() => setDataSheet(true)}>
+                Backup
+              </Btn>
+            </div>
+
+            <DataSheet
+              open={dataSheet}
+              onClose={() => setDataSheet(false)}
+              data={data}
+              persistence={persistence}
+              sessionInCorso={sessionInCorso}
+              onRestore={onRestore}
+              onReset={onReset}
+            />
+
+            {sessions.length === 0 ? (
+              <div style={emptyBox}>Nessun allenamento salvato. Il primo comparirà qui.</div>
+            ) : (
+              <>
+                <div style={{ display: "flex", gap: 10, marginBottom: 22 }}>
+                  <Stat label="Ultimi 7 giorni" value={weekCount} />
+                  <Stat label="Ultimi 30 giorni" value={monthCount} />
+                  <Stat label="Totali" value={sessions.length} />
+                </div>
+
+                {sessions.map((s) => {
+                  const isOpen = open === s.id;
+                  const nSets = s.entries.reduce((n, e) => n + e.sets.length, 0);
+                  const vol = s.entries.reduce(
+                    (n, e) => n + e.sets.reduce((m, x) => m + setVolume(x), 0),
+                    0
+                  );
+                  return (
+                    <div key={s.id} style={{ ...cardBox, marginBottom: 10 }}>
+                      <button
+                        onClick={() => setOpen(isOpen ? null : s.id)}
+                        style={{
+                          display: "flex",
+                          width: "100%",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          background: "transparent",
+                          border: "none",
+                          color: C.text,
+                          padding: 0,
+                          cursor: "pointer",
+                          fontFamily: "inherit",
+                          textAlign: "left",
+                        }}
+                      >
+                        <span>
+                          <span style={{ display: "block", fontSize: 16, fontWeight: 600 }}>{s.name}</span>
+                          <span style={{ display: "block", fontSize: 13, color: C.muted, marginTop: 3 }}>
+                            {fmtDate(s.startedAt)} · {s.entries.length} esercizi · {nSets} serie
+                            {vol > 0 ? ` · ${Math.round(vol).toLocaleString("it-IT")} kg` : ""}
+                          </span>
+                        </span>
+                        <span style={{ color: C.muted, fontSize: 13 }}>{isOpen ? "▾" : "▸"}</span>
+                      </button>
+
+                      {isOpen && (
+                        <div style={{ marginTop: 14, borderTop: `1px solid ${C.surface2}`, paddingTop: 12 }}>
+                          {s.entries.map((e, i) => (
+                            <div key={e.id} style={{ marginBottom: 12 }}>
+                              <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>
+                                <span style={{ color: C.muted, marginRight: 6 }}>{i + 1}</span>
+                                {exName(e.exerciseId)}
+                              </div>
+                              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                                {e.sets.map((set, j) => (
+                                  <span key={j} style={chip}>
+                                    {set.w != null ? `${set.w}kg` : "cl"}
+                                    {set.r != null ? ` × ${set.r}` : ""}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </div>
+        );
+      }
+
+      /* ------------------------------- stili ------------------------------- */
+
+      const h1 = {
+        fontFamily: "'Barlow Condensed', sans-serif",
+        fontSize: 34,
+        fontWeight: 700,
+        letterSpacing: "0.005em",
+        margin: "0 0 8px",
+        lineHeight: 1.05,
+      };
+
+      const cardBox = {
+        background: C.surface,
+        border: `1px solid #262E37`,
+        borderRadius: 14,
+        padding: "14px 14px",
+      };
+
+      const rowCard = {
+        ...cardBox,
+        display: "flex",
+        width: "100%",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 12,
+        marginBottom: 10,
+        color: C.text,
+        fontFamily: "inherit",
+        cursor: "pointer",
+        textAlign: "left",
+      };
+
+      const emptyBox = {
+        border: `1px dashed ${C.line}`,
+        borderRadius: 12,
+        padding: "18px 16px",
+        color: C.muted,
+        fontSize: 14,
+        lineHeight: 1.5,
+        marginBottom: 12,
+      };
+
+      const chip = {
+        background: C.surface2,
+        border: `1px solid ${C.line}`,
+        borderRadius: 8,
+        padding: "5px 9px",
+        fontSize: 13,
+        fontVariantNumeric: "tabular-nums",
+      };
+
+      const sezioneTitolo = {
+        fontSize: 15,
+        fontWeight: 600,
+        marginBottom: 6,
+      };
+
+      const sezioneTesto = {
+        fontSize: 13,
+        color: C.muted,
+        lineHeight: 1.5,
+        margin: "0 0 12px",
+      };
+
+      const avvio = document.getElementById("avvio");
+      if (avvio) avvio.remove();
+      ReactDOM.createRoot(document.getElementById("root")).render(<Gimmo />);
+    </script>
+  </body>
+</html>
