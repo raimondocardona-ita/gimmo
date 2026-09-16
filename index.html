@@ -210,13 +210,25 @@
       // Versione della forma dei dati salvati, non dell'app.
       // Va alzata solo quando cambia la struttura di esercizi/schede/sessioni,
       // e ogni salto va gestito in migrate(): lo storico di un utente non si butta.
-      const SCHEMA_VERSION = 1;
+      const SCHEMA_VERSION = 2;
+
+      // Etichetta visibile in fondo allo Storico. Serve a sapere dal telefono
+      // quale versione stai usando, senza dover aprire il codice.
+      const APP_VERSION = "16 settembre 2026 · lotti 1-4";
+
+      // Recupero proposto quando non ne è stato scelto uno. Unico punto da
+      // cambiare: vale per le schede e per gli esercizi aggiunti al volo.
+      const REST_DEFAULT = 60;
+
+      // Secondi di preparazione prima di un esercizio a tempo.
+      const PREP_SECONDS = 5;
 
       const emptyData = () => ({
         schemaVersion: SCHEMA_VERSION,
         exercises: [],
         routines: [],
         sessions: [],
+        programs: [],
       });
 
       const C = {
@@ -252,6 +264,31 @@
       }
       function fmtDateShort(iso) {
         return new Date(iso).toLocaleDateString("it-IT", { day: "2-digit", month: "2-digit" });
+      }
+
+      // Una serie può essere di tre tipi: carico × ripetizioni, a cedimento (max),
+      // oppure a tempo. Un solo punto di formattazione per chip, storico e
+      // riepiloghi, così non si disallineano mai tra loro.
+      function fmtSet(set, short = false) {
+        if (set.d != null) return `${set.d}s`;
+        const load = set.w != null ? `${set.w}kg` : short ? "cl" : "corpo libero";
+        if (set.max) return `${load} × ${set.r != null ? `${set.r} max` : "max"}`;
+        return set.r != null ? `${load} × ${set.r}` : load;
+      }
+
+      // Voce di sistema. La prima frase parte sempre da un tocco dell'utente
+      // (il tasto Avvia): su iPhone è quel tocco a sbloccare la sintesi vocale
+      // per tutte le frasi successive, che arrivano invece dal timer.
+      function say(text) {
+        try {
+          const synth = window.speechSynthesis;
+          if (!synth) return;
+          const u = new SpeechSynthesisUtterance(text);
+          u.lang = "it-IT";
+          u.rate = 1.05;
+          synth.cancel();
+          synth.speak(u);
+        } catch (e) {}
       }
 
       /* ----------------------------- persistenza ---------------------------- *
@@ -393,7 +430,13 @@
           d = { ...d, schemaVersion: 1 };
           v = 1;
         }
-        // if (v === 1) { d = migraA2(d); v = 2; }
+        // 1 → 2: nascono i programmi, cioè i cicli di schede che si alternano.
+        // Chi aggiorna non ne ha nessuno: lista vuota e nient'altro da toccare.
+        // Esercizi, schede e allenamenti restano intatti.
+        if (v === 1) {
+          d = { ...d, programs: Array.isArray(d.programs) ? d.programs : [], schemaVersion: 2 };
+          v = 2;
+        }
 
         if (v > SCHEMA_VERSION) {
           // Dati scritti da una versione più recente di Gimmo: leggerli male e
@@ -406,7 +449,7 @@
         // sbagliato no: è il segno che il dato è rovinato, e azzerarlo in silenzio
         // vorrebbe dire cancellare lo storico. In quel caso ci si ferma.
         const campi = {};
-        for (const nome of ["exercises", "routines", "sessions"]) {
+        for (const nome of ["exercises", "routines", "sessions", "programs"]) {
           const v = d[nome];
           if (v === undefined || v === null) campi[nome] = [];
           else if (Array.isArray(v)) campi[nome] = v;
@@ -555,9 +598,27 @@
 
         sessions.sort((a, b) => new Date(a.startedAt) - new Date(b.startedAt));
 
+        // I programmi puntano alle schede per id, e le schede qui non vengono
+        // mai rinumerate: basta non duplicarli. Senza questo blocco, ripristinare
+        // un backup farebbe sparire in silenzio tutti i cicli.
+        const programs = [...(current.programs || [])];
+        const programIds = new Set(programs.map((p) => p.id));
+        let nuoviProgrammi = 0;
+        for (const p of incoming.programs || []) {
+          if (!p || !p.id || programIds.has(p.id)) continue;
+          programs.push(p);
+          programIds.add(p.id);
+          nuoviProgrammi += 1;
+        }
+
         return {
-          data: { schemaVersion: SCHEMA_VERSION, exercises, routines, sessions },
-          added: { exercises: nuoviEsercizi, routines: nuoveSchede, sessions: nuoviAllenamenti },
+          data: { schemaVersion: SCHEMA_VERSION, exercises, routines, sessions, programs },
+          added: {
+            exercises: nuoviEsercizi,
+            routines: nuoveSchede,
+            sessions: nuoviAllenamenti,
+            programs: nuoviProgrammi,
+          },
         };
       }
 
@@ -677,6 +738,7 @@
         let best = null;
         let bestSet = null;
         let totalSets = 0;
+        let totalTime = 0;
         for (const ses of sessions) {
           for (const en of ses.entries) {
             if (en.exerciseId !== exerciseId || en.sets.length === 0) continue;
@@ -685,6 +747,7 @@
             for (const s of en.sets) {
               totalSets += 1;
               vol += setVolume(s);
+              if (s.d != null) totalTime += s.d;
               if (s.w != null && (top == null || s.w > top)) top = s.w;
               if (s.w != null && (best == null || s.w > best)) {
                 best = s.w;
@@ -695,7 +758,7 @@
           }
         }
         points.sort((a, b) => new Date(a.date) - new Date(b.date));
-        return { points, best, bestSet, totalSets, sessions: points.length };
+        return { points, best, bestSet, totalSets, totalTime, sessions: points.length };
       }
 
       function lastPerformance(sessions, exerciseId) {
@@ -838,7 +901,9 @@
         flexShrink: 0,
       };
 
-      function Sheet({ open, onClose, title, children }) {
+      // `sticky` è una zona che resta ancorata in alto mentre il resto scorre:
+      // serve per i campi di ricerca, che non devono muoversi sotto le dita.
+      function Sheet({ open, onClose, title, sticky, children }) {
         if (!open) return null;
         return (
           <div
@@ -863,15 +928,34 @@
                 maxWidth: 520,
                 maxHeight: "86vh",
                 overflowY: "auto",
-                padding: "18px 18px 28px",
+                padding: "0 18px 28px",
                 boxSizing: "border-box",
               }}
             >
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-                <h2 style={{ margin: 0, fontSize: 19, fontWeight: 600 }}>{title}</h2>
-                <Btn tone="quiet" size="sm" onClick={onClose}>
-                  Chiudi
-                </Btn>
+              <div
+                style={{
+                  position: "sticky",
+                  top: 0,
+                  zIndex: 2,
+                  background: C.surface,
+                  margin: "0 -18px",
+                  padding: "18px 18px 12px",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginBottom: sticky ? 12 : 4,
+                  }}
+                >
+                  <h2 style={{ margin: 0, fontSize: 19, fontWeight: 600 }}>{title}</h2>
+                  <Btn tone="quiet" size="sm" onClick={onClose}>
+                    Chiudi
+                  </Btn>
+                </div>
+                {sticky}
               </div>
               {children}
             </div>
@@ -971,6 +1055,7 @@
         });
         const audioRef = useRef(null);
         const firedRef = useRef(false);
+        const tickRef = useRef(null);
 
         useEffect(() => {
           let annullato = false;
@@ -1059,22 +1144,72 @@
 
         const remaining = timer ? timer.endsAt - now : 0;
 
+        // Macchina a fasi: preparazione → lavoro → recupero.
+        // Ogni fase ha il suo suono e, quando arriva a zero, decide da sola
+        // che cosa viene dopo. Il conto resta su un orario di fine assoluto.
         useEffect(() => {
           if (!timer) {
             firedRef.current = false;
+            tickRef.current = null;
             return;
           }
-          if (remaining <= 0 && !firedRef.current) {
-            firedRef.current = true;
-            beep();
-            try {
-              navigator.vibrate && navigator.vibrate([220, 90, 220]);
-            } catch (e) {}
+          const phase = timer.phase || "rest";
+
+          if (remaining > 0) {
+            firedRef.current = false;
+            // Il countdown si aggiorna 4 volte al secondo: tickRef ricorda
+            // quale secondo ha già suonato, così il bip non si ripete.
+            const left = Math.ceil(remaining / 1000);
+            const key = `${phase}:${left}`;
+            if (tickRef.current !== key) {
+              tickRef.current = key;
+              if (phase === "prep" || (phase === "work" && left <= 3)) tick();
+            }
+            return;
           }
-          if (remaining > 0) firedRef.current = false;
+
+          if (firedRef.current) return;
+          firedRef.current = true;
+
+          if (phase === "prep") {
+            goTone();
+            say("Via");
+            setActive((a) =>
+              a && a.timer
+                ? {
+                    ...a,
+                    timer: {
+                      ...a.timer,
+                      phase: "work",
+                      endsAt: Date.now() + a.timer.duration * 1000,
+                      total: a.timer.duration,
+                    },
+                  }
+                : a
+            );
+            setNow(Date.now());
+            return;
+          }
+
+          if (phase === "work") {
+            endTone();
+            say("Stop");
+            try {
+              navigator.vibrate && navigator.vibrate([320, 120, 320]);
+            } catch (e) {}
+            closeTimedSet(timer.duration);
+            return;
+          }
+
+          beep();
+          try {
+            navigator.vibrate && navigator.vibrate([220, 90, 220]);
+          } catch (e) {}
         }, [remaining, timer]);
 
-        const beep = useCallback(() => {
+        // Un solo generatore di suono, parametrico. Tutti i segnali dell'app
+        // (bip singolo, doppio, nota di partenza, nota di stop) nascono da qui.
+        const playTone = useCallback((freq, offset = 0, dur = 0.22, vol = 0.35) => {
           try {
             if (!audioRef.current) {
               const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -1082,20 +1217,29 @@
             }
             const ctx = audioRef.current;
             if (ctx.state === "suspended") ctx.resume();
-            [0, 0.28].forEach((offset) => {
-              const o = ctx.createOscillator();
-              const g = ctx.createGain();
-              o.type = "sine";
-              o.frequency.value = 880;
-              g.gain.setValueAtTime(0.0001, ctx.currentTime + offset);
-              g.gain.exponentialRampToValueAtTime(0.35, ctx.currentTime + offset + 0.02);
-              g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + offset + 0.22);
-              o.connect(g).connect(ctx.destination);
-              o.start(ctx.currentTime + offset);
-              o.stop(ctx.currentTime + offset + 0.24);
-            });
+            const o = ctx.createOscillator();
+            const g = ctx.createGain();
+            o.type = "sine";
+            o.frequency.value = freq;
+            g.gain.setValueAtTime(0.0001, ctx.currentTime + offset);
+            g.gain.exponentialRampToValueAtTime(vol, ctx.currentTime + offset + 0.02);
+            g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + offset + dur);
+            o.connect(g).connect(ctx.destination);
+            o.start(ctx.currentTime + offset);
+            o.stop(ctx.currentTime + offset + dur + 0.02);
           } catch (e) {}
         }, []);
+
+        const beep = useCallback(() => {
+          playTone(880, 0);
+          playTone(880, 0.28);
+        }, [playTone]);
+        const tick = useCallback(() => playTone(620, 0, 0.09, 0.22), [playTone]);
+        const goTone = useCallback(() => playTone(1046, 0, 0.4, 0.4), [playTone]);
+        const endTone = useCallback(() => {
+          playTone(660, 0, 0.5, 0.35);
+          playTone(440, 0.12, 0.5, 0.3);
+        }, [playTone]);
 
         const primeAudio = useCallback(() => {
           try {
@@ -1133,13 +1277,39 @@
           });
         const deleteRoutine = (id) => setData((d) => ({ ...d, routines: d.routines.filter((r) => r.id !== id) }));
 
-        const startSession = (routine) => {
+        const saveProgram = (program) =>
+          setData((d) => {
+            const exists = d.programs.some((p) => p.id === program.id);
+            return {
+              ...d,
+              programs: exists
+                ? d.programs.map((p) => (p.id === program.id ? program : p))
+                : [...d.programs, program],
+            };
+          });
+        const deleteProgram = (id) => setData((d) => ({ ...d, programs: d.programs.filter((p) => p.id !== id) }));
+
+        // Il segnaposto del ciclo. Parte dal giorno appena chiuso, non da dove
+        // credeva di essere: così vale anche se ti alleni fuori turno.
+        // Arrivato in fondo, il ciclo riparte da capo.
+        const moveCursor = (programId, fromIndex) =>
+          setData((d) => ({
+            ...d,
+            programs: d.programs.map((p) =>
+              p.id === programId ? { ...p, cursor: p.days.length ? (fromIndex + 1) % p.days.length : 0 } : p
+            ),
+          }));
+        const skipProgramDay = (program) => moveCursor(program.id, program.cursor ?? 0);
+
+        const startSession = (routine, program = null, dayIndex = null) => {
           primeAudio();
           const session = {
             id: uid(),
             startedAt: todayISO(),
             endedAt: null,
             routineId: routine ? routine.id : null,
+            programId: program ? program.id : null,
+            programDay: program ? dayIndex : null,
             name: routine ? routine.name : "Allenamento libero",
             entries: routine
               ? routine.items.map((it) => ({
@@ -1162,8 +1332,68 @@
 
         const startRest = (seconds, label) => {
           primeAudio();
-          setActive((a) => (a ? { ...a, timer: { endsAt: Date.now() + seconds * 1000, total: seconds, label } } : a));
+          setActive((a) =>
+            a ? { ...a, timer: { phase: "rest", endsAt: Date.now() + seconds * 1000, total: seconds, label } } : a
+          );
           setNow(Date.now());
+        };
+
+        // Avvia un esercizio a tempo. Nel timer porto tutto quello che servirà
+        // alla fine (quale esercizio, quanto dura, che recupero attaccare), così
+        // le fasi successive non devono ripescarlo dalla sessione.
+        const startTimed = (entry, label) => {
+          primeAudio();
+          say("Preparazione");
+          const duration = entry.targetDuration || 30;
+          setActive((a) =>
+            a
+              ? {
+                  ...a,
+                  timer: {
+                    phase: "prep",
+                    endsAt: Date.now() + PREP_SECONDS * 1000,
+                    total: PREP_SECONDS,
+                    label,
+                    entryId: entry.id,
+                    duration,
+                    restAfter: entry.rest,
+                  },
+                }
+              : a
+          );
+          setNow(Date.now());
+        };
+
+        // Registra la serie a tempo con la durata effettiva e attacca il recupero.
+        // Un solo aggiornamento atomico: serie e timer cambiano insieme.
+        const closeTimedSet = (seconds) => {
+          setActive((a) => {
+            if (!a || !a.timer) return a;
+            const t = a.timer;
+            const session = {
+              ...a.session,
+              entries: a.session.entries.map((e) =>
+                e.id === t.entryId ? { ...e, sets: [...e.sets, { d: seconds, at: todayISO() }] } : e
+              ),
+            };
+            return {
+              ...a,
+              session,
+              timer: t.restAfter
+                ? { phase: "rest", endsAt: Date.now() + t.restAfter * 1000, total: t.restAfter, label: t.label }
+                : null,
+            };
+          });
+          setNow(Date.now());
+        };
+
+        // Tasto "Fine" durante l'esercizio: registra i secondi davvero fatti,
+        // non quelli programmati. Serve su stretching e tenute.
+        const finishTimedNow = () => {
+          if (!timer || timer.phase !== "work") return;
+          const doneSecs = Math.max(1, Math.round(timer.total - Math.max(0, remaining) / 1000));
+          endTone();
+          closeTimedSet(doneSecs);
         };
         const adjustRest = (delta) =>
           setActive((a) =>
@@ -1184,7 +1414,11 @@
           if (!active) return;
           const s = active.session;
           const kept = { ...s, endedAt: todayISO(), entries: s.entries.filter((e) => e.sets.length > 0) };
-          if (kept.entries.length) setData((d) => ({ ...d, sessions: [...d.sessions, kept] }));
+          if (kept.entries.length) {
+            setData((d) => ({ ...d, sessions: [...d.sessions, kept] }));
+            // Un allenamento annullato o vuoto non deve far avanzare il ciclo.
+            if (kept.programId && kept.programDay != null) moveCursor(kept.programId, kept.programDay);
+          }
           setActive(null);
           setTab(kept.entries.length ? "storico" : "allena");
         };
@@ -1257,19 +1491,24 @@
                   exName={exName}
                   addExercise={addExercise}
                   startSession={startSession}
+                  skipProgramDay={skipProgramDay}
                   updateSession={updateSession}
                   startRest={startRest}
+                  startTimed={startTimed}
                   finishSession={finishSession}
                   discardSession={discardSession}
                 />
               )}
               {tab === "schede" && (
-                <RoutinesView
+                <PlanView
                   data={data}
                   exName={exName}
                   addExercise={addExercise}
+                  renameExercise={renameExercise}
                   saveRoutine={saveRoutine}
                   deleteRoutine={deleteRoutine}
+                  saveProgram={saveProgram}
+                  deleteProgram={deleteProgram}
                   startSession={startSession}
                   hasActive={!!active}
                 />
@@ -1295,11 +1534,12 @@
             </div>
 
             {timer && (
-              <RestBar
+              <TimerBar
                 remaining={remaining}
                 timer={timer}
                 onAdjust={adjustRest}
                 onStop={stopRest}
+                onFinishNow={finishTimedNow}
               />
             )}
 
@@ -1366,16 +1606,23 @@
         boxSizing: "border-box",
       };
 
-      /* --------------------------- barra recupero -------------------------- */
+      /* ---------------------------- barra timer ---------------------------- */
 
-      function RestBar({ remaining, timer, onAdjust, onStop }) {
+      function TimerBar({ remaining, timer, onAdjust, onStop, onFinishNow }) {
+        const phase = timer.phase || "rest";
+        const prep = phase === "prep";
+        const work = phase === "work";
         const done = remaining <= 0;
+        const restDone = !prep && !work && done;
         const pct = Math.max(0, Math.min(1, remaining / (timer.total * 1000)));
+        const accent = prep ? C.yellow : work ? C.blue : done ? C.green : C.yellow;
+        const secs = Math.max(0, Math.ceil(remaining / 1000));
+
         return (
           <div
             style={{
-              borderTop: `1px solid ${done ? C.green : C.line}`,
-              background: done ? "#16281D" : C.surface,
+              borderTop: `1px solid ${restDone ? C.green : C.line}`,
+              background: restDone ? "#16281D" : C.surface,
               padding: "12px 16px 14px",
             }}
           >
@@ -1384,7 +1631,7 @@
                 style={{
                   width: `${pct * 100}%`,
                   height: "100%",
-                  background: done ? C.green : C.yellow,
+                  background: accent,
                   transition: "width .25s linear",
                 }}
               />
@@ -1399,10 +1646,10 @@
                     lineHeight: 0.95,
                     letterSpacing: "0.01em",
                     fontVariantNumeric: "tabular-nums",
-                    color: done ? C.green : C.text,
+                    color: prep ? C.yellow : restDone ? C.green : C.text,
                   }}
                 >
-                  {done ? "Vai" : fmtClock(remaining)}
+                  {prep ? secs : restDone ? "Vai" : fmtClock(remaining)}
                 </div>
                 <div
                   style={{
@@ -1413,18 +1660,37 @@
                     textOverflow: "ellipsis",
                   }}
                 >
-                  {done ? "Recupero finito" : `Recupero · ${timer.label}`}
+                  {prep
+                    ? `Preparati · ${timer.label}`
+                    : work
+                    ? `In corso · ${timer.label}`
+                    : restDone
+                    ? "Recupero finito"
+                    : `Recupero · ${timer.label}`}
                 </div>
               </div>
-              <Btn size="sm" onClick={() => onAdjust(-15)} aria-label="meno 15 secondi">
-                −15s
-              </Btn>
-              <Btn size="sm" onClick={() => onAdjust(15)} aria-label="più 15 secondi">
-                +15s
-              </Btn>
-              <Btn size="sm" tone={done ? "go" : "ghost"} onClick={onStop}>
-                {done ? "Ok" : "Salta"}
-              </Btn>
+
+              {work ? (
+                <Btn size="sm" tone="go" onClick={onFinishNow}>
+                  Fine
+                </Btn>
+              ) : prep ? (
+                <Btn size="sm" onClick={onStop}>
+                  Annulla
+                </Btn>
+              ) : (
+                <>
+                  <Btn size="sm" onClick={() => onAdjust(-15)} aria-label="meno 15 secondi">
+                    −15s
+                  </Btn>
+                  <Btn size="sm" onClick={() => onAdjust(15)} aria-label="più 15 secondi">
+                    +15s
+                  </Btn>
+                  <Btn size="sm" tone={done ? "go" : "ghost"} onClick={onStop}>
+                    {done ? "Ok" : "Salta"}
+                  </Btn>
+                </>
+              )}
             </div>
           </div>
         );
@@ -1438,7 +1704,7 @@
         return <LiveSession {...props} />;
       }
 
-      function StartPanel({ data, startSession }) {
+      function StartPanel({ data, startSession, skipProgramDay }) {
         const [lastSessions] = useMemo(
           () => [[...data.sessions].sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt)).slice(0, 3)],
           [data.sessions]
@@ -1450,7 +1716,49 @@
               Parti da una scheda salvata, oppure aggiungi gli esercizi mano a mano.
             </p>
 
-            <Btn tone="primary" size="lg" style={{ width: "100%", marginBottom: 22 }} onClick={() => startSession(null)}>
+            {data.programs.length > 0 && (
+              <>
+                <div style={{ fontSize: 13, color: C.muted, marginBottom: 10 }}>
+                  {data.programs.length > 1 ? "I tuoi programmi" : "Il tuo programma"}
+                </div>
+                {data.programs.map((p) => {
+                  const idx = p.days.length ? (p.cursor ?? 0) % p.days.length : 0;
+                  const day = p.days[idx];
+                  const routine = day && !day.rest ? data.routines.find((r) => r.id === day.routineId) : null;
+                  return (
+                    <div key={p.id} style={{ ...cardBox, marginBottom: 10 }}>
+                      <div style={{ fontSize: 13, color: C.muted }}>{p.name}</div>
+                      <div style={{ fontSize: 18, fontWeight: 600, margin: "4px 0 2px" }}>
+                        {!day ? "Programma vuoto" : day.rest ? "Riposo" : routine ? routine.name : "Scheda eliminata"}
+                      </div>
+                      <div style={{ fontSize: 13, color: C.muted, marginBottom: 12 }}>
+                        Giorno {idx + 1} di {p.days.length}
+                      </div>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        {routine && (
+                          <Btn tone="primary" size="sm" onClick={() => startSession(routine, p, idx)}>
+                            Inizia
+                          </Btn>
+                        )}
+                        {day && (
+                          <Btn size="sm" onClick={() => skipProgramDay(p)}>
+                            {day.rest ? "Segna riposo fatto" : "Salta giorno"}
+                          </Btn>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+                <div style={{ height: 22 }} />
+              </>
+            )}
+
+            <Btn
+              tone={data.programs.length ? "ghost" : "primary"}
+              size="lg"
+              style={{ width: "100%", marginBottom: 22 }}
+              onClick={() => startSession(null)}
+            >
               Allenamento libero
             </Btn>
 
@@ -1491,7 +1799,17 @@
         );
       }
 
-      function LiveSession({ data, active, exName, addExercise, updateSession, startRest, finishSession, discardSession }) {
+      function LiveSession({
+        data,
+        active,
+        exName,
+        addExercise,
+        updateSession,
+        startRest,
+        startTimed,
+        finishSession,
+        discardSession,
+      }) {
         const s = active.session;
         const [openId, setOpenId] = useState(s.entries[0]?.id || null);
         const [adding, setAdding] = useState(false);
@@ -1499,7 +1817,7 @@
 
         const elapsed = Date.now() - new Date(s.startedAt).getTime();
 
-        const addEntry = (exerciseId, rest = 90) => {
+        const addEntry = (exerciseId, rest = REST_DEFAULT) => {
           const entry = {
             id: uid(),
             exerciseId,
@@ -1551,6 +1869,7 @@
                 onToggle={() => setOpenId(openId === entry.id ? null : entry.id)}
                 onPatch={(p) => patchEntry(entry.id, p)}
                 startRest={startRest}
+                startTimed={startTimed}
                 history={lastPerformance(data.sessions, entry.exerciseId)}
               />
             ))}
@@ -1586,23 +1905,31 @@
         );
       }
 
-      function EntryCard({ index, entry, name, open, onToggle, onPatch, startRest, history }) {
+      function EntryCard({ index, entry, name, open, onToggle, onPatch, startRest, startTimed, history }) {
         const lastSet = entry.sets[entry.sets.length - 1];
         const historyLast = history?.sets?.[history.sets.length - 1];
         const seed = lastSet || historyLast || {};
+        // targetReps può valere "max": per il contatore serve comunque un numero.
+        const targetReps = typeof entry.targetReps === "number" ? entry.targetReps : null;
         const [w, setW] = useState(seed.w ?? 0);
-        const [r, setR] = useState(seed.r ?? entry.targetReps ?? 10);
+        const [r, setR] = useState(seed.r ?? targetReps ?? 10);
+        const [amrap, setAmrap] = useState(seed.max === true || entry.targetReps === "max");
         const [editRest, setEditRest] = useState(false);
 
         useEffect(() => {
           if (lastSet) {
             setW(lastSet.w ?? 0);
             setR(lastSet.r ?? r);
+            if (lastSet.max != null) setAmrap(!!lastSet.max);
           }
         }, [entry.sets.length]);
 
+        const timed = entry.mode === "time";
+        const duration = entry.targetDuration ?? 30;
+
         const logSet = (weight, reps) => {
           const set = { w: weight > 0 ? weight : null, r: reps > 0 ? reps : null, at: todayISO() };
+          if (amrap) set.max = true;
           onPatch({ sets: [...entry.sets, set] });
           if (entry.rest) startRest(entry.rest, name);
         };
@@ -1673,8 +2000,7 @@
                 {entry.sets.map((set, i) => (
                   <span key={i} style={chip}>
                     <span style={{ color: C.muted, marginRight: 4 }}>{i + 1}</span>
-                    {set.w != null ? `${set.w}kg` : "corpo libero"}
-                    {set.r != null ? ` × ${set.r}` : ""}
+                    {fmtSet(set)}
                   </span>
                 ))}
               </div>
@@ -1685,26 +2011,94 @@
                 {history && (
                   <div style={{ fontSize: 13, color: C.muted, margin: "12px 0 14px" }}>
                     Ultima volta ({fmtDateShort(history.date)}):{" "}
-                    {history.sets
-                      .map((s) => `${s.w != null ? s.w + "kg" : "cl"}${s.r != null ? "×" + s.r : ""}`)
-                      .join(" · ")}
+                    {history.sets.map((s) => fmtSet(s, true)).join(" · ")}
                   </div>
                 )}
 
-                <div style={{ display: "flex", gap: 18, alignItems: "center", marginBottom: 14, flexWrap: "wrap" }}>
-                  <div>
-                    <div style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>Carico (kg)</div>
-                    <Stepper value={w} onChange={setW} step={2.5} decimals={1} suffix="kg" />
-                  </div>
-                  <div>
-                    <div style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>Ripetizioni</div>
-                    <Stepper value={r} onChange={setR} step={1} width={62} />
-                  </div>
+                <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+                  {[
+                    ["reps", "Serie × rip"],
+                    ["time", "A tempo"],
+                  ].map(([m, label]) => (
+                    <Btn
+                      key={m}
+                      size="sm"
+                      tone={(entry.mode || "reps") === m ? "primary" : "ghost"}
+                      onClick={() =>
+                        onPatch({
+                          mode: m,
+                          targetDuration: m === "time" ? entry.targetDuration ?? 30 : entry.targetDuration,
+                        })
+                      }
+                    >
+                      {label}
+                    </Btn>
+                  ))}
                 </div>
 
-                <Btn tone="go" size="lg" style={{ width: "100%", marginBottom: 10 }} onClick={() => logSet(w, r)}>
-                  Serie fatta{w > 0 ? ` · ${w}kg × ${r}` : ` · ${r} rip`}
-                </Btn>
+                {timed ? (
+                  <>
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>Durata</div>
+                      <Stepper
+                        value={duration}
+                        onChange={(v) => onPatch({ targetDuration: v })}
+                        step={5}
+                        min={5}
+                        suffix="s"
+                        width={72}
+                      />
+                    </div>
+
+                    <Btn
+                      tone="go"
+                      size="lg"
+                      style={{ width: "100%", marginBottom: 10 }}
+                      onClick={() => startTimed(entry, name)}
+                    >
+                      Avvia · {duration}s
+                    </Btn>
+
+                    <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>
+                      {PREP_SECONDS} secondi di preparazione con un bip al secondo, poi parte l'esercizio. Gli ultimi
+                      3 secondi suonano di nuovo, la serie si registra da sola e il recupero parte subito dopo.
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ display: "flex", gap: 18, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
+                      <div>
+                        <div style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>Carico (kg)</div>
+                        <Stepper value={w} onChange={setW} step={2.5} decimals={1} suffix="kg" />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>Ripetizioni</div>
+                        <Stepper value={r} onChange={setR} step={1} width={62} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>A cedimento</div>
+                        <Btn
+                          size="md"
+                          tone={amrap ? "primary" : "ghost"}
+                          onClick={() => setAmrap(!amrap)}
+                          style={{ height: 44, minWidth: 64 }}
+                        >
+                          max
+                        </Btn>
+                      </div>
+                    </div>
+
+                    {amrap && (
+                      <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>
+                        Lascia le ripetizioni a 0 se non le hai contate.
+                      </div>
+                    )}
+
+                    <Btn tone="go" size="lg" style={{ width: "100%", marginBottom: 10 }} onClick={() => logSet(w, r)}>
+                      Serie fatta · {fmtSet({ w: w > 0 ? w : null, r: r > 0 ? r : null, max: amrap })}
+                    </Btn>
+                  </>
+                )}
 
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   <Btn
@@ -1746,7 +2140,7 @@
                 <Input
                   type="number"
                   inputMode="numeric"
-                  defaultValue={entry.rest ?? 90}
+                  defaultValue={entry.rest ?? REST_DEFAULT}
                   onChange={(e) => onPatch({ rest: Math.max(0, parseInt(e.target.value || "0", 10)) })}
                 />
               </Field>
@@ -1771,27 +2165,34 @@
         }, [sessions]);
 
         return (
-          <Sheet open={open} onClose={onClose} title="Aggiungi esercizio">
-            <Input
-              autoFocus
-              placeholder="Cerca o scrivi un nome nuovo"
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              style={{ marginBottom: 14 }}
-            />
-            {q.trim() && !exact && (
-              <Btn
-                tone="primary"
-                size="lg"
-                style={{ width: "100%", marginBottom: 16 }}
-                onClick={() => {
-                  onCreate(q);
-                  setQ("");
-                }}
-              >
-                Crea “{q.trim()}”
-              </Btn>
-            )}
+          <Sheet
+            open={open}
+            onClose={onClose}
+            title="Aggiungi esercizio"
+            sticky={
+              <>
+                <Input
+                  autoFocus
+                  placeholder="Cerca o scrivi un nome nuovo"
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                />
+                {q.trim() && !exact && (
+                  <Btn
+                    tone="primary"
+                    size="md"
+                    style={{ width: "100%", marginTop: 10 }}
+                    onClick={() => {
+                      onCreate(q);
+                      setQ("");
+                    }}
+                  >
+                    Crea “{q.trim()}”
+                  </Btn>
+                )}
+              </>
+            }
+          >
             {!q && recent.length > 0 && (
               <>
                 <div style={{ fontSize: 13, color: C.muted, marginBottom: 8 }}>Recenti</div>
@@ -1808,8 +2209,12 @@
                 </div>
               </>
             )}
-            {filtered.length === 0 && !q ? (
-              <div style={emptyBox}>La libreria è vuota. Scrivi un nome qui sopra per creare il primo esercizio.</div>
+            {filtered.length === 0 ? (
+              <div style={{ ...emptyBox, marginTop: 4 }}>
+                {q
+                  ? "Nessun esercizio con questo nome. Crealo con il tasto qui sopra."
+                  : "La libreria è vuota. Scrivi un nome qui sopra per creare il primo esercizio."}
+              </div>
             ) : (
               filtered.map((ex) => (
                 <button key={ex.id} onClick={() => onPick(ex.id)} style={{ ...rowCard, marginBottom: 8 }}>
@@ -1824,38 +2229,97 @@
 
       /* ------------------------------- Schede ------------------------------ */
 
-      function RoutinesView({ data, exName, addExercise, saveRoutine, deleteRoutine, startSession, hasActive }) {
-        const [editing, setEditing] = useState(null);
+      // Un solo posto per costruire le cose che si ripetono: le schede (esercizi
+      // in ordine) e i programmi (schede in ordine). Gli editor occupano tutta la
+      // pagina, quindi l'interruttore in alto compare solo quando non stai
+      // modificando nulla.
+      function PlanView({
+        data,
+        exName,
+        addExercise,
+        renameExercise,
+        saveRoutine,
+        deleteRoutine,
+        saveProgram,
+        deleteProgram,
+        startSession,
+        hasActive,
+      }) {
+        const [sub, setSub] = useState("schede");
+        const [editingRoutine, setEditingRoutine] = useState(null);
+        const [editingProgram, setEditingProgram] = useState(null);
 
-        if (editing) {
+        if (editingRoutine)
           return (
             <RoutineEditor
-              routine={editing}
+              routine={editingRoutine}
               data={data}
               exName={exName}
               addExercise={addExercise}
+              renameExercise={renameExercise}
               onSave={(r) => {
                 saveRoutine(r);
-                setEditing(null);
+                setEditingRoutine(null);
               }}
-              onCancel={() => setEditing(null)}
+              onCancel={() => setEditingRoutine(null)}
             />
           );
-        }
+
+        if (editingProgram)
+          return (
+            <ProgramEditor
+              program={editingProgram}
+              data={data}
+              onSave={(p) => {
+                saveProgram(p);
+                setEditingProgram(null);
+              }}
+              onCancel={() => setEditingProgram(null)}
+            />
+          );
 
         return (
           <div style={{ padding: "26px 18px" }}>
+            <div style={{ display: "flex", gap: 8, marginBottom: 22 }}>
+              <Btn size="sm" tone={sub === "schede" ? "primary" : "ghost"} onClick={() => setSub("schede")}>
+                Schede
+              </Btn>
+              <Btn size="sm" tone={sub === "programmi" ? "primary" : "ghost"} onClick={() => setSub("programmi")}>
+                Programmi
+              </Btn>
+            </div>
+
+            {sub === "schede" ? (
+              <RoutinesList
+                data={data}
+                exName={exName}
+                deleteRoutine={deleteRoutine}
+                startSession={startSession}
+                hasActive={hasActive}
+                onNew={() => setEditingRoutine({ id: uid(), name: "", items: [] })}
+                onEdit={(r) => setEditingRoutine(JSON.parse(JSON.stringify(r)))}
+              />
+            ) : (
+              <ProgramsList
+                data={data}
+                deleteProgram={deleteProgram}
+                onNew={() => setEditingProgram({ id: uid(), name: "", days: [], cursor: 0 })}
+                onEdit={(p) => setEditingProgram(JSON.parse(JSON.stringify(p)))}
+              />
+            )}
+          </div>
+        );
+      }
+
+      function RoutinesList({ data, exName, deleteRoutine, startSession, hasActive, onNew, onEdit }) {
+        return (
+          <>
             <h1 style={h1}>Schede</h1>
             <p style={{ color: C.muted, marginTop: 0, marginBottom: 22, fontSize: 15, lineHeight: 1.5 }}>
-              Un programma che ripeti nel tempo: esercizi in ordine, serie e recuperi fissi.
+              Una sequenza di esercizi che ripeti nel tempo: ordine, serie e recuperi fissi.
             </p>
 
-            <Btn
-              tone="primary"
-              size="lg"
-              style={{ width: "100%", marginBottom: 22 }}
-              onClick={() => setEditing({ id: uid(), name: "", items: [] })}
-            >
+            <Btn tone="primary" size="lg" style={{ width: "100%", marginBottom: 22 }} onClick={onNew}>
               Nuova scheda
             </Btn>
 
@@ -1872,7 +2336,7 @@
                     <Btn size="sm" tone="primary" disabled={hasActive} onClick={() => startSession(r)}>
                       Inizia
                     </Btn>
-                    <Btn size="sm" onClick={() => setEditing(JSON.parse(JSON.stringify(r)))}>
+                    <Btn size="sm" onClick={() => onEdit(r)}>
                       Modifica
                     </Btn>
                     <Btn size="sm" tone="danger" onClick={() => deleteRoutine(r.id)}>
@@ -1882,19 +2346,206 @@
                 </div>
               ))
             )}
+          </>
+        );
+      }
+
+      /* ------------------------------ Programmi ---------------------------- */
+
+      function ProgramsList({ data, deleteProgram, onNew, onEdit }) {
+        const rName = (id) => data.routines.find((r) => r.id === id)?.name || "scheda eliminata";
+        return (
+          <>
+            <h1 style={h1}>Programmi</h1>
+            <p style={{ color: C.muted, marginTop: 0, marginBottom: 22, fontSize: 15, lineHeight: 1.5 }}>
+              Un ciclo di schede che si alternano: push, pull, gambe, riposo. Gimmo tiene il segno e nella schermata
+              Allena ti propone sempre il giorno giusto. Finito il ciclo, riparte da capo.
+            </p>
+
+            {data.routines.length === 0 && (
+              <div style={emptyBox}>Prima servono le schede: un programma non è altro che il loro ordine.</div>
+            )}
+
+            <Btn
+              tone="primary"
+              size="lg"
+              style={{ width: "100%", marginBottom: 22 }}
+              disabled={data.routines.length === 0}
+              onClick={onNew}
+            >
+              Nuovo programma
+            </Btn>
+
+            {data.programs.length === 0 ? (
+              <div style={emptyBox}>Nessun programma salvato.</div>
+            ) : (
+              data.programs.map((p) => {
+                const next = p.days.length ? (p.cursor ?? 0) % p.days.length : 0;
+                return (
+                  <div key={p.id} style={{ ...cardBox, marginBottom: 12 }}>
+                    <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>{p.name || "Senza nome"}</div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
+                      {p.days.map((d, i) => (
+                        <span
+                          key={d.id}
+                          style={{
+                            ...chip,
+                            borderColor: i === next ? C.yellow : C.line,
+                            color: i === next ? C.yellow : C.text,
+                          }}
+                        >
+                          {d.rest ? "riposo" : rName(d.routineId)}
+                        </span>
+                      ))}
+                    </div>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <Btn size="sm" onClick={() => onEdit(p)}>
+                        Modifica
+                      </Btn>
+                      <Btn size="sm" tone="danger" onClick={() => deleteProgram(p.id)}>
+                        Elimina
+                      </Btn>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </>
+        );
+      }
+
+      function ProgramEditor({ program, data, onSave, onCancel }) {
+        const [name, setName] = useState(program.name);
+        const [days, setDays] = useState(program.days);
+        const [adding, setAdding] = useState(false);
+        const rName = (id) => data.routines.find((r) => r.id === id)?.name || "Scheda eliminata";
+
+        const addDay = (day) => {
+          setDays((d) => [...d, { id: uid(), ...day }]);
+          setAdding(false);
+        };
+        const remove = (id) => setDays((d) => d.filter((x) => x.id !== id));
+        const move = (i, dir) =>
+          setDays((d) => {
+            const j = i + dir;
+            if (j < 0 || j >= d.length) return d;
+            const copy = [...d];
+            [copy[i], copy[j]] = [copy[j], copy[i]];
+            return copy;
+          });
+
+        return (
+          <div style={{ padding: "22px 18px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+              <h1 style={{ ...h1, marginBottom: 0 }}>{program.name ? "Modifica programma" : "Nuovo programma"}</h1>
+              <Btn size="sm" tone="quiet" onClick={onCancel}>
+                Annulla
+              </Btn>
+            </div>
+
+            <Field label="Nome del programma">
+              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Es. Push / Pull / Gambe" />
+            </Field>
+
+            <div style={{ fontSize: 13, color: C.muted, margin: "18px 0 10px" }}>Giorni del ciclo</div>
+
+            {days.length === 0 && (
+              <div style={emptyBox}>
+                Aggiungi il primo giorno. Metti anche i riposi, se vuoi che il ciclo li conti.
+              </div>
+            )}
+
+            {days.map((d, i) => (
+              <div key={d.id} style={{ ...cardBox, marginBottom: 10, display: "flex", alignItems: "center", gap: 10 }}>
+                <span
+                  style={{
+                    fontFamily: "'Barlow Condensed', sans-serif",
+                    fontSize: 24,
+                    fontWeight: 600,
+                    color: C.muted,
+                    width: 20,
+                    flexShrink: 0,
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  {i + 1}
+                </span>
+                <span
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    fontSize: 16,
+                    fontWeight: 600,
+                    color: d.rest ? C.muted : C.text,
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
+                  {d.rest ? "Riposo" : rName(d.routineId)}
+                </span>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  <button onClick={() => move(i, -1)} style={miniBtn} aria-label="sposta su">
+                    ↑
+                  </button>
+                  <button onClick={() => move(i, 1)} style={miniBtn} aria-label="sposta giù">
+                    ↓
+                  </button>
+                  <button onClick={() => remove(d.id)} style={{ ...miniBtn, color: C.red }} aria-label="rimuovi">
+                    ×
+                  </button>
+                </div>
+              </div>
+            ))}
+
+            <Btn size="lg" style={{ width: "100%", marginTop: 12 }} onClick={() => setAdding(true)}>
+              + Aggiungi giorno
+            </Btn>
+
+            <Btn
+              tone="primary"
+              size="lg"
+              style={{ width: "100%", marginTop: 20 }}
+              disabled={!name.trim() || days.length === 0}
+              onClick={() =>
+                onSave({
+                  ...program,
+                  name: name.trim(),
+                  days,
+                  // Se il ciclo si accorcia, il segnaposto non deve restare fuori.
+                  cursor: days.length ? Math.min(program.cursor ?? 0, days.length - 1) : 0,
+                })
+              }
+            >
+              Salva programma
+            </Btn>
+
+            <Sheet open={adding} onClose={() => setAdding(false)} title="Aggiungi giorno">
+              <Btn size="lg" style={{ width: "100%", marginBottom: 18 }} onClick={() => addDay({ rest: true })}>
+                Giorno di riposo
+              </Btn>
+              <div style={{ fontSize: 13, color: C.muted, marginBottom: 8 }}>Le tue schede</div>
+              {data.routines.map((r) => (
+                <button key={r.id} onClick={() => addDay({ routineId: r.id })} style={{ ...rowCard, marginBottom: 8 }}>
+                  <span style={{ fontSize: 15, fontWeight: 500 }}>{r.name || "Senza nome"}</span>
+                  <span style={{ color: C.blue, fontSize: 13, fontWeight: 600 }}>Aggiungi</span>
+                </button>
+              ))}
+            </Sheet>
           </div>
         );
       }
 
-      function RoutineEditor({ routine, data, exName, addExercise, onSave, onCancel }) {
+      function RoutineEditor({ routine, data, exName, addExercise, renameExercise, onSave, onCancel }) {
         const [name, setName] = useState(routine.name);
         const [items, setItems] = useState(routine.items);
         const [adding, setAdding] = useState(false);
+        const [renaming, setRenaming] = useState(null); // id dell'esercizio da rinominare
 
         const addItem = (exerciseId) => {
           setItems((it) => [
             ...it,
-            { id: uid(), exerciseId, mode: "reps", sets: 3, reps: 10, duration: 60, rest: 90 },
+            { id: uid(), exerciseId, mode: "reps", sets: 3, reps: 10, duration: 60, rest: REST_DEFAULT },
           ]);
           setAdding(false);
         };
@@ -1936,21 +2587,43 @@
                       fontWeight: 600,
                       color: C.muted,
                       width: 20,
+                      flexShrink: 0,
                       fontVariantNumeric: "tabular-nums",
                     }}
                   >
                     {i + 1}
                   </span>
-                  <span style={{ flex: 1, fontSize: 16, fontWeight: 600 }}>{exName(it.exerciseId)}</span>
-                  <button onClick={() => move(i, -1)} style={miniBtn} aria-label="sposta su">
-                    ↑
-                  </button>
-                  <button onClick={() => move(i, 1)} style={miniBtn} aria-label="sposta giù">
-                    ↓
-                  </button>
-                  <button onClick={() => remove(it.id)} style={{ ...miniBtn, color: C.red }} aria-label="rimuovi">
-                    ×
-                  </button>
+                  <span
+                    style={{
+                      flex: 1,
+                      minWidth: 0,
+                      fontSize: 16,
+                      fontWeight: 600,
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {exName(it.exerciseId)}
+                  </span>
+                  <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                    <button
+                      onClick={() => setRenaming(it.exerciseId)}
+                      style={miniBtn}
+                      aria-label={`rinomina ${exName(it.exerciseId)}`}
+                    >
+                      ✎
+                    </button>
+                    <button onClick={() => move(i, -1)} style={miniBtn} aria-label="sposta su">
+                      ↑
+                    </button>
+                    <button onClick={() => move(i, 1)} style={miniBtn} aria-label="sposta giù">
+                      ↓
+                    </button>
+                    <button onClick={() => remove(it.id)} style={{ ...miniBtn, color: C.red }} aria-label="rimuovi">
+                      ×
+                    </button>
+                  </div>
                 </div>
 
                 <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
@@ -1968,7 +2641,7 @@
                   {it.mode === "reps" ? (
                     <>
                       <SmallNum label="Serie" value={it.sets} onChange={(v) => patch(it.id, { sets: v })} />
-                      <SmallNum label="Ripetizioni" value={it.reps} onChange={(v) => patch(it.id, { reps: v })} />
+                      <RepsField value={it.reps} onChange={(v) => patch(it.id, { reps: v })} />
                     </>
                   ) : (
                     <SmallNum label="Durata (s)" value={it.duration} onChange={(v) => patch(it.id, { duration: v })} />
@@ -2003,9 +2676,61 @@
                 if (id) addItem(id);
               }}
             />
+
+            {renaming && (
+              <RenameExerciseSheet
+                key={renaming}
+                name={exName(renaming)}
+                onClose={() => setRenaming(null)}
+                onSave={(n) => {
+                  renameExercise(renaming, n);
+                  setRenaming(null);
+                }}
+              />
+            )}
           </div>
         );
       }
+
+      // `key={renaming}` nel punto in cui viene usato forza il rimontaggio a ogni
+      // apertura: così il campo parte sempre dal nome giusto, senza sincronizzare
+      // nulla a mano.
+      function RenameExerciseSheet({ name, onClose, onSave }) {
+        const [value, setValue] = useState(name);
+        const clean = value.trim();
+        return (
+          <Sheet open onClose={onClose} title="Rinomina esercizio">
+            <p style={{ color: C.muted, fontSize: 14, lineHeight: 1.5, marginTop: 0 }}>
+              Il nome cambia ovunque: in archivio, nelle altre schede e nello storico. Le serie già registrate restano
+              attaccate a questo esercizio.
+            </p>
+            <Field label="Nome">
+              <Input
+                autoFocus
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && clean && onSave(clean)}
+              />
+            </Field>
+            <Btn tone="primary" size="lg" style={{ width: "100%" }} disabled={!clean} onClick={() => onSave(clean)}>
+              Salva nome
+            </Btn>
+          </Sheet>
+        );
+      }
+
+      const numInput = {
+        width: 92,
+        background: C.bg,
+        border: `1px solid ${C.line}`,
+        color: C.text,
+        borderRadius: 9,
+        padding: "9px 10px",
+        fontSize: 16,
+        fontFamily: "inherit",
+        outline: "none",
+        boxSizing: "border-box",
+      };
 
       function SmallNum({ label, value, onChange }) {
         return (
@@ -2016,19 +2741,33 @@
               inputMode="numeric"
               value={value ?? ""}
               onChange={(e) => onChange(e.target.value === "" ? null : Math.max(0, parseInt(e.target.value, 10)))}
-              style={{
-                width: 92,
-                background: C.bg,
-                border: `1px solid ${C.line}`,
-                color: C.text,
-                borderRadius: 9,
-                padding: "9px 10px",
-                fontSize: 16,
-                fontFamily: "inherit",
-                outline: "none",
-                boxSizing: "border-box",
-              }}
+              style={numInput}
             />
+          </label>
+        );
+      }
+
+      // Le ripetizioni di una scheda possono essere un numero oppure "max"
+      // (serie a cedimento). Il valore "max" viaggia poi fino all'allenamento.
+      function RepsField({ value, onChange }) {
+        const isMax = value === "max";
+        return (
+          <label style={{ display: "block" }}>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 5 }}>Ripetizioni</div>
+            <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
+              <input
+                type="number"
+                inputMode="numeric"
+                disabled={isMax}
+                placeholder={isMax ? "max" : ""}
+                value={isMax || value == null ? "" : value}
+                onChange={(e) => onChange(e.target.value === "" ? null : Math.max(0, parseInt(e.target.value, 10)))}
+                style={{ ...numInput, width: 56, opacity: isMax ? 0.45 : 1 }}
+              />
+              <Btn size="sm" tone={isMax ? "primary" : "ghost"} onClick={() => onChange(isMax ? 10 : "max")}>
+                max
+              </Btn>
+            </div>
           </label>
         );
       }
@@ -2094,7 +2833,13 @@
                     <span>
                       <span style={{ display: "block", fontSize: 16, fontWeight: 500 }}>{ex.name}</span>
                       <span style={{ display: "block", fontSize: 13, color: C.muted, marginTop: 3 }}>
-                        {st.sessions ? `${st.sessions} allenamenti · massimo ${st.best ?? "—"}kg` : "mai allenato"}
+                        {!st.sessions
+                          ? "mai allenato"
+                          : st.best != null
+                          ? `${st.sessions} allenamenti · massimo ${st.best}kg`
+                          : st.totalTime
+                          ? `${st.sessions} allenamenti · ${fmtClock(st.totalTime * 1000)} totali`
+                          : `${st.sessions} allenamenti`}
                       </span>
                     </span>
                     <span style={{ color: C.muted }}>›</span>
@@ -2128,7 +2873,11 @@
             <div style={{ display: "flex", gap: 10, marginTop: 22, marginBottom: 20 }}>
               <Stat label="Allenamenti" value={st.sessions} />
               <Stat label="Serie totali" value={st.totalSets} />
-              <Stat label="Massimo" value={st.best != null ? `${st.best}kg` : "—"} />
+              {st.best == null && st.totalTime > 0 ? (
+                <Stat label="Tempo totale" value={fmtClock(st.totalTime * 1000)} />
+              ) : (
+                <Stat label="Massimo" value={st.best != null ? `${st.best}kg` : "—"} />
+              )}
             </div>
 
             {st.points.length >= 2 ? (
@@ -2205,7 +2954,10 @@
           plur(d.exercises.length, "esercizio", "esercizi"),
           plur(d.routines.length, "scheda", "schede"),
           plur(d.sessions.length, "allenamento", "allenamenti"),
-        ].join(" · ");
+          (d.programs || []).length ? plur(d.programs.length, "programma", "programmi") : null,
+        ]
+          .filter(Boolean)
+          .join(" · ");
 
       const ERRORI_BACKUP = {
         json: "Il file non è leggibile. Controlla di aver scelto un backup di Gimmo e non un altro file.",
@@ -2594,8 +3346,7 @@
                               <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                                 {e.sets.map((set, j) => (
                                   <span key={j} style={chip}>
-                                    {set.w != null ? `${set.w}kg` : "cl"}
-                                    {set.r != null ? ` × ${set.r}` : ""}
+                                    {fmtSet(set, true)}
                                   </span>
                                 ))}
                               </div>
@@ -2608,6 +3359,10 @@
                 })}
               </>
             )}
+
+            <div style={{ fontSize: 12, color: C.muted, textAlign: "center", marginTop: 28 }}>
+              Gimmo · {APP_VERSION}
+            </div>
           </div>
         );
       }
