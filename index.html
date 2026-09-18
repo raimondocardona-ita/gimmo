@@ -214,13 +214,14 @@
 
       // Etichetta visibile in fondo allo Storico. Serve a sapere dal telefono
       // quale versione stai usando, senza dover aprire il codice.
-      const APP_VERSION = "17 settembre 2026 · lotti 5-8";
+      const APP_VERSION = "18 settembre 2026 · lotti 9-10";
 
       // Recupero proposto quando non ne è stato scelto uno. Unico punto da
       // cambiare: vale per le schede e per gli esercizi aggiunti al volo.
       const REST_DEFAULT = 60;
 
-      // Secondi di preparazione prima di un esercizio a tempo.
+      // Secondi di preparazione prima di un esercizio a tempo. È il valore di
+      // riserva: quello vero arriva dalle impostazioni, o dalla singola scheda.
       const PREP_SECONDS = 5;
 
       // Le impostazioni vivono dentro l'archivio, non a parte: così finiscono
@@ -231,6 +232,7 @@
         defaultReps: 10,
         defaultDuration: 60,
         defaultRest: REST_DEFAULT,
+        prepSeconds: PREP_SECONDS,
         // Cosa mostrare.
         showVolume: true,
         showLastTime: true,
@@ -303,6 +305,37 @@
           synth.cancel();
           synth.speak(u);
         } catch (e) {}
+      }
+
+      /* -------------------------------- gruppi ------------------------------ *
+       * I gruppi non sono una sezione dell'archivio: sono un'etichetta attaccata
+       * a schede ed esercizi. Un gruppo nasce quando scrivi il suo nome e muore
+       * quando l'ultimo elemento lo lascia — niente gruppi vuoti da ripulire,
+       * niente schermata per amministrarli, e soprattutto nessuna migrazione:
+       * un campo che manca vale "senza gruppo".
+       * -------------------------------------------------------------------- */
+
+      const SENZA_GRUPPO = "Senza gruppo";
+
+      const groupsOf = (x) => (x && Array.isArray(x.groups) ? x.groups.filter(Boolean) : []);
+
+      // Tutti i gruppi in uso, in ordine alfabetico.
+      function allGroups(items) {
+        const set = new Set();
+        for (const it of items || []) for (const g of groupsOf(it)) set.add(g);
+        return [...set].sort((a, b) => a.localeCompare(b, "it"));
+      }
+
+      // Divide gli elementi in sezioni. Un elemento con due gruppi compare in due
+      // sezioni: è esattamente il senso di poterne avere più di uno.
+      function groupSections(items) {
+        const out = allGroups(items).map((g) => ({
+          name: g,
+          items: (items || []).filter((it) => groupsOf(it).includes(g)),
+        }));
+        const orfani = (items || []).filter((it) => groupsOf(it).length === 0);
+        if (orfani.length) out.push({ name: SENZA_GRUPPO, items: orfani });
+        return out;
       }
 
       /* ----------------------------- persistenza ---------------------------- *
@@ -1087,6 +1120,81 @@
         );
       }
 
+      // Intestazione di sezione richiudibile. Lo stato di apertura vive nella
+      // schermata che la usa, non qui: così una sola lista sa cosa ha chiuso.
+      function Section({ name, count, open, onToggle, children }) {
+        return (
+          <div style={{ marginBottom: 12 }}>
+            <button
+              onClick={onToggle}
+              style={{
+                display: "flex",
+                width: "100%",
+                alignItems: "center",
+                gap: 10,
+                background: "transparent",
+                border: "none",
+                borderBottom: `1px solid ${C.line}`,
+                color: C.text,
+                padding: "8px 2px",
+                marginBottom: 10,
+                cursor: "pointer",
+                fontFamily: "inherit",
+                textAlign: "left",
+              }}
+            >
+              <span style={{ color: C.muted, fontSize: 13, width: 12 }}>{open ? "▾" : "▸"}</span>
+              <span style={{ flex: 1, minWidth: 0, fontSize: 14, fontWeight: 600 }}>{name}</span>
+              <span style={{ fontSize: 13, color: C.muted }}>{count}</span>
+            </button>
+            {open && children}
+          </div>
+        );
+      }
+
+      // Assegna i gruppi a una scheda o a un esercizio: tocchi quelli che esistono
+      // già, oppure ne scrivi uno nuovo. `suggestions` contiene tutti quelli in uso
+      // più quelli di questo elemento, così nessuno resta invisibile.
+      function GroupField({ value, suggestions, onChange, label = "Gruppi" }) {
+        const [nuovo, setNuovo] = useState("");
+        const scelti = Array.isArray(value) ? value : [];
+        const tutti = [...new Set([...(suggestions || []), ...scelti])].sort((a, b) => a.localeCompare(b, "it"));
+
+        const commuta = (g) => onChange(scelti.includes(g) ? scelti.filter((x) => x !== g) : [...scelti, g]);
+        const aggiungi = () => {
+          const g = nuovo.trim();
+          setNuovo("");
+          if (!g || scelti.includes(g)) return;
+          onChange([...scelti, g]);
+        };
+
+        return (
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 6 }}>{label}</div>
+            {tutti.length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+                {tutti.map((g) => (
+                  <Btn key={g} size="sm" tone={scelti.includes(g) ? "primary" : "ghost"} onClick={() => commuta(g)}>
+                    {g}
+                  </Btn>
+                ))}
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 8 }}>
+              <Input
+                value={nuovo}
+                placeholder="Nuovo gruppo"
+                onChange={(e) => setNuovo(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && aggiungi()}
+              />
+              <Btn size="md" onClick={aggiungi} disabled={!nuovo.trim()} style={{ flexShrink: 0 }}>
+                Aggiungi
+              </Btn>
+            </div>
+          </div>
+        );
+      }
+
       function Sparkline({ points, valueKey }) {
         const vals = points.map((p) => p[valueKey]).filter((v) => v != null && v > 0);
         if (vals.length < 2) return null;
@@ -1398,6 +1506,8 @@
           setData((d) => ({ ...d, exercises: d.exercises.map((e) => (e.id === id ? { ...e, name } : e)) }));
         const deleteExercise = (id) =>
           setData((d) => ({ ...d, exercises: d.exercises.filter((e) => e.id !== id) }));
+        const setExerciseGroups = (id, groups) =>
+          setData((d) => ({ ...d, exercises: d.exercises.map((e) => (e.id === id ? { ...e, groups } : e)) }));
 
         const saveRoutine = (routine) =>
           setData((d) => {
@@ -1463,7 +1573,13 @@
 
         const startSession = (routine, program = null, dayIndex = null, slot = null) => {
           primeAudio();
+          // La preparazione si decide qui una volta sola e viaggia con la
+          // sessione: la scheda batte le impostazioni, le impostazioni battono
+          // il valore di riserva. Così il timer non deve andare a ricercarla.
+          const base = { ...DEFAULT_SETTINGS, ...(data.settings || {}) };
+          const prep = Math.max(1, routine?.prepSeconds ?? base.prepSeconds ?? PREP_SECONDS);
           const session = {
+            prep,
             id: uid(),
             startedAt: todayISO(),
             endedAt: null,
@@ -1523,6 +1639,7 @@
         const runEntry = (entry) => {
           primeAudio();
           const nome = exName(entry.exerciseId);
+          const prep = (active && active.session && active.session.prep) || PREP_SECONDS;
           say(nome);
           setActive((a) =>
             a
@@ -1533,8 +1650,8 @@
                     entry.mode === "time"
                       ? {
                           phase: "prep",
-                          endsAt: Date.now() + PREP_SECONDS * 1000,
-                          total: PREP_SECONDS,
+                          endsAt: Date.now() + prep * 1000,
+                          total: prep,
                           label: nome,
                           entryId: entry.id,
                           duration: entry.targetDuration || 30,
@@ -1574,14 +1691,15 @@
           primeAudio();
           say("Preparazione");
           const duration = entry.targetDuration || 30;
+          const prep = (active && active.session && active.session.prep) || PREP_SECONDS;
           setActive((a) =>
             a
               ? {
                   ...a,
                   timer: {
                     phase: "prep",
-                    endsAt: Date.now() + PREP_SECONDS * 1000,
-                    total: PREP_SECONDS,
+                    endsAt: Date.now() + prep * 1000,
+                    total: prep,
                     label,
                     entryId: entry.id,
                     duration,
@@ -1766,6 +1884,7 @@
                   addExercise={addExercise}
                   renameExercise={renameExercise}
                   deleteExercise={deleteExercise}
+                  setExerciseGroups={setExerciseGroups}
                 />
               )}
               {tab === "impostazioni" && (
@@ -2109,6 +2228,7 @@
       }) {
         const s = active.session;
         const circuit = !!active.circuit;
+        const prep = s.prep || PREP_SECONDS;
         const settings = { ...DEFAULT_SETTINGS, ...(data.settings || {}) };
         const [openId, setOpenId] = useState(s.entries[0]?.id || null);
         const [adding, setAdding] = useState(false);
@@ -2163,8 +2283,9 @@
               <div style={{ ...cardBox, marginBottom: 14 }}>
                 <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 4 }}>Scheda a tempo</div>
                 <div style={{ fontSize: 13, color: C.muted, lineHeight: 1.5, marginBottom: 12 }}>
-                  Gimmo annuncia l'esercizio, conta {PREP_SECONDS} secondi di preparazione e va avanti da solo fino in
-                  fondo. Parti quando sei pronto: questo tocco serve anche ad accendere audio e voce.
+                  Posa il telefono: da qui in poi fa tutto lui. Ti dice che esercizio tocca, ti dà {prep} secondi per
+                  metterti in posizione, poi va avanti da solo fino alla fine. Tocca Avvia quando sei pronto — serve
+                  anche ad accendere la voce.
                 </div>
                 <Btn tone="go" size="lg" style={{ width: "100%" }} onClick={startCircuit}>
                   Avvia circuito
@@ -2190,6 +2311,7 @@
                 circuit={circuit}
                 advanceCircuit={advanceCircuit}
                 settings={settings}
+                prep={prep}
                 history={lastPerformance(data.sessions, entry.exerciseId)}
               />
             ))}
@@ -2237,6 +2359,7 @@
         circuit,
         advanceCircuit,
         settings,
+        prep,
         history,
       }) {
         const lastSet = entry.sets[entry.sets.length - 1];
@@ -2396,8 +2519,8 @@
                     </Btn>
 
                     <div style={{ fontSize: 12, color: C.muted, marginBottom: 12, lineHeight: 1.5 }}>
-                      {PREP_SECONDS} secondi di preparazione con un bip al secondo, poi parte l'esercizio. Gli ultimi
-                      3 secondi suonano di nuovo, la serie si registra da sola e il recupero parte subito dopo.
+                      Un bip al secondo per {prep || PREP_SECONDS} secondi: il tempo di metterti in posizione. Poi
+                      parte. Gli ultimi 3 secondi risuonano, la serie si segna da sola e il recupero parte subito.
                     </div>
                   </>
                 ) : (
@@ -2490,7 +2613,16 @@
 
       function AddExerciseSheet({ open, onClose, exercises, sessions, onPick, onCreate }) {
         const [q, setQ] = useState("");
-        const filtered = exercises.filter((e) => e.name.toLowerCase().includes(q.trim().toLowerCase()));
+        // null = nessun filtro. È qui che il filtro serve davvero: telefono in
+        // mano, tra una serie e l'altra, con duecento esercizi in archivio.
+        const [gruppo, setGruppo] = useState(null);
+        const gruppi = allGroups(exercises);
+
+        const filtered = exercises.filter(
+          (e) =>
+            e.name.toLowerCase().includes(q.trim().toLowerCase()) &&
+            (gruppo == null || groupsOf(e).includes(gruppo))
+        );
         const exact = exercises.some((e) => e.name.toLowerCase() === q.trim().toLowerCase());
 
         const recent = useMemo(() => {
@@ -2527,6 +2659,23 @@
                     Crea “{q.trim()}”
                   </Btn>
                 )}
+                {gruppi.length > 0 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
+                    <Btn size="sm" tone={gruppo == null ? "primary" : "ghost"} onClick={() => setGruppo(null)}>
+                      Tutti
+                    </Btn>
+                    {gruppi.map((g) => (
+                      <Btn
+                        key={g}
+                        size="sm"
+                        tone={gruppo === g ? "primary" : "ghost"}
+                        onClick={() => setGruppo(gruppo === g ? null : g)}
+                      >
+                        {g}
+                      </Btn>
+                    ))}
+                  </div>
+                )}
               </>
             }
           >
@@ -2550,6 +2699,8 @@
               <div style={{ ...emptyBox, marginTop: 4 }}>
                 {q
                   ? "Nessun esercizio con questo nome. Crealo con il tasto qui sopra."
+                  : gruppo
+                  ? `Nessun esercizio nel gruppo “${gruppo}”.`
                   : "La libreria è vuota. Scrivi un nome qui sopra per creare il primo esercizio."}
               </div>
             ) : (
@@ -2649,6 +2800,29 @@
       }
 
       function RoutinesList({ data, exName, deleteRoutine, startSession, hasActive, onNew, onEdit }) {
+        const [chiusi, setChiusi] = useState([]);
+        const sezioni = allGroups(data.routines).length ? groupSections(data.routines) : [];
+
+        const riga = (r) => (
+          <div key={r.id} style={{ ...cardBox, marginBottom: 12 }}>
+            <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 4 }}>{r.name || "Senza nome"}</div>
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 12 }}>
+              {r.items.map((it, i) => `${i + 1}. ${exName(it.exerciseId)}`).join("  ")}
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <Btn size="sm" tone="primary" disabled={hasActive} onClick={() => startSession(r)}>
+                Inizia
+              </Btn>
+              <Btn size="sm" onClick={() => onEdit(r)}>
+                Modifica
+              </Btn>
+              <Btn size="sm" tone="danger" onClick={() => deleteRoutine(r.id)}>
+                Elimina
+              </Btn>
+            </div>
+          </div>
+        );
+
         return (
           <>
             <h1 style={h1}>Schede</h1>
@@ -2662,25 +2836,21 @@
 
             {data.routines.length === 0 ? (
               <div style={emptyBox}>Nessuna scheda salvata.</div>
+            ) : sezioni.length === 0 ? (
+              data.routines.map(riga)
             ) : (
-              data.routines.map((r) => (
-                <div key={r.id} style={{ ...cardBox, marginBottom: 12 }}>
-                  <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 4 }}>{r.name || "Senza nome"}</div>
-                  <div style={{ fontSize: 13, color: C.muted, marginBottom: 12 }}>
-                    {r.items.map((it, i) => `${i + 1}. ${exName(it.exerciseId)}`).join("  ")}
-                  </div>
-                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                    <Btn size="sm" tone="primary" disabled={hasActive} onClick={() => startSession(r)}>
-                      Inizia
-                    </Btn>
-                    <Btn size="sm" onClick={() => onEdit(r)}>
-                      Modifica
-                    </Btn>
-                    <Btn size="sm" tone="danger" onClick={() => deleteRoutine(r.id)}>
-                      Elimina
-                    </Btn>
-                  </div>
-                </div>
+              sezioni.map((sez) => (
+                <Section
+                  key={sez.name}
+                  name={sez.name}
+                  count={sez.items.length}
+                  open={!chiusi.includes(sez.name)}
+                  onToggle={() =>
+                    setChiusi((c) => (c.includes(sez.name) ? c.filter((x) => x !== sez.name) : [...c, sez.name]))
+                  }
+                >
+                  {sez.items.map(riga)}
+                </Section>
               ))
             )}
           </>
@@ -2980,8 +3150,12 @@
         const [adding, setAdding] = useState(false);
         const [renaming, setRenaming] = useState(null); // id dell'esercizio da rinominare
         const [flow, setFlow] = useState(routine.flow || "click");
+        // null = questa scheda non ha un valore suo e segue le impostazioni.
+        const [prep, setPrep] = useState(routine.prepSeconds ?? null);
+        const [gruppi, setGruppi] = useState(groupsOf(routine));
 
         const base = { ...DEFAULT_SETTINGS, ...(data.settings || {}) };
+        const prepEffettiva = Math.max(1, prep ?? base.prepSeconds ?? PREP_SECONDS);
 
         const addItem = (exerciseId) => {
           setItems((it) => [
@@ -3022,6 +3196,8 @@
               <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Es. Full body A" />
             </Field>
 
+            <GroupField value={gruppi} suggestions={allGroups(data.routines)} onChange={setGruppi} />
+
             <div style={{ fontSize: 13, color: C.muted, marginBottom: 6 }}>Come scorre</div>
             <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
               <Btn size="sm" tone={flow === "click" ? "primary" : "ghost"} onClick={() => setFlow("click")}>
@@ -3033,9 +3209,19 @@
             </div>
             <p style={{ fontSize: 12, color: C.muted, lineHeight: 1.5, margin: "0 0 4px" }}>
               {flow === "click"
-                ? "Decidi tu quando passare all'esercizio successivo."
-                : `Gimmo scorre da solo: dice il nome dell'esercizio, conta ${PREP_SECONDS} secondi di preparazione e passa al successivo appena finito il recupero. Gli esercizi a ripetizioni aspettano il tuo tocco.`}
+                ? "Passi all'esercizio dopo quando vuoi tu."
+                : "Non devi toccare niente: ti dice che esercizio tocca, ti lascia il tempo di metterti in posizione e va avanti da solo. Comoda per circuiti e stretching. Gli esercizi a ripetizioni aspettano comunque il tuo tocco."}
             </p>
+
+            {flow === "timed" && (
+              <div style={{ marginTop: 12 }}>
+                <SmallNum label="Preparazione (s)" value={prep} onChange={setPrep} />
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 6, lineHeight: 1.5 }}>
+                  Il tempo per metterti in posizione prima di ogni esercizio. Lascia vuoto per usare il valore delle
+                  impostazioni ({base.prepSeconds ?? PREP_SECONDS}s). Ora vale {prepEffettiva}s.
+                </div>
+              </div>
+            )}
 
             <div style={{ fontSize: 13, color: C.muted, margin: "18px 0 10px" }}>Esercizi</div>
 
@@ -3118,7 +3304,7 @@
               size="lg"
               style={{ width: "100%", marginTop: 20 }}
               disabled={!name.trim() || items.length === 0}
-              onClick={() => onSave({ ...routine, name: name.trim(), items, flow })}
+              onClick={() => onSave({ ...routine, name: name.trim(), items, flow, prepSeconds: prep, groups: gruppi })}
             >
               Salva scheda
             </Btn>
@@ -3232,9 +3418,10 @@
 
       /* ------------------------------ Esercizi ----------------------------- */
 
-      function ExercisesView({ data, addExercise, renameExercise, deleteExercise }) {
+      function ExercisesView({ data, addExercise, renameExercise, deleteExercise, setExerciseGroups }) {
         const [name, setName] = useState("");
         const [detail, setDetail] = useState(null);
+        const [chiusi, setChiusi] = useState([]);
 
         const submit = () => {
           if (!name.trim()) return;
@@ -3250,6 +3437,8 @@
                 ex={ex}
                 sessions={data.sessions}
                 settings={{ ...DEFAULT_SETTINGS, ...(data.settings || {}) }}
+                gruppiUsati={allGroups(data.exercises)}
+                onSetGroups={setExerciseGroups}
                 onBack={() => setDetail(null)}
                 onRename={renameExercise}
                 onDelete={(id) => {
@@ -3261,6 +3450,30 @@
         }
 
         const sorted = [...data.exercises].sort((a, b) => a.name.localeCompare(b.name, "it"));
+        // Senza nemmeno un gruppo la lista resta piatta: intestazioni inutili
+        // sarebbero solo un ostacolo in più tra te e l'esercizio.
+        const sezioni = allGroups(sorted).length ? groupSections(sorted) : [];
+
+        const riga = (ex) => {
+          const st = exerciseStats(data.sessions, ex.id);
+          return (
+            <button key={ex.id} onClick={() => setDetail(ex.id)} style={{ ...rowCard, marginBottom: 8 }}>
+              <span>
+                <span style={{ display: "block", fontSize: 16, fontWeight: 500 }}>{ex.name}</span>
+                <span style={{ display: "block", fontSize: 13, color: C.muted, marginTop: 3 }}>
+                  {!st.sessions
+                    ? "mai allenato"
+                    : st.best != null
+                    ? `${st.sessions} allenamenti · massimo ${st.best}kg`
+                    : st.totalTime
+                    ? `${st.sessions} allenamenti · ${fmtClock(st.totalTime * 1000)} totali`
+                    : `${st.sessions} allenamenti`}
+                </span>
+              </span>
+              <span style={{ color: C.muted }}>›</span>
+            </button>
+          );
+        };
 
         return (
           <div style={{ padding: "26px 18px" }}>
@@ -3284,33 +3497,28 @@
 
             {sorted.length === 0 ? (
               <div style={emptyBox}>Nessun esercizio in archivio.</div>
+            ) : sezioni.length === 0 ? (
+              sorted.map(riga)
             ) : (
-              sorted.map((ex) => {
-                const st = exerciseStats(data.sessions, ex.id);
-                return (
-                  <button key={ex.id} onClick={() => setDetail(ex.id)} style={{ ...rowCard, marginBottom: 8 }}>
-                    <span>
-                      <span style={{ display: "block", fontSize: 16, fontWeight: 500 }}>{ex.name}</span>
-                      <span style={{ display: "block", fontSize: 13, color: C.muted, marginTop: 3 }}>
-                        {!st.sessions
-                          ? "mai allenato"
-                          : st.best != null
-                          ? `${st.sessions} allenamenti · massimo ${st.best}kg`
-                          : st.totalTime
-                          ? `${st.sessions} allenamenti · ${fmtClock(st.totalTime * 1000)} totali`
-                          : `${st.sessions} allenamenti`}
-                      </span>
-                    </span>
-                    <span style={{ color: C.muted }}>›</span>
-                  </button>
-                );
-              })
+              sezioni.map((sez) => (
+                <Section
+                  key={sez.name}
+                  name={sez.name}
+                  count={sez.items.length}
+                  open={!chiusi.includes(sez.name)}
+                  onToggle={() =>
+                    setChiusi((c) => (c.includes(sez.name) ? c.filter((x) => x !== sez.name) : [...c, sez.name]))
+                  }
+                >
+                  {sez.items.map(riga)}
+                </Section>
+              ))
             )}
           </div>
         );
       }
 
-      function ExerciseDetail({ ex, sessions, settings, onBack, onRename, onDelete }) {
+      function ExerciseDetail({ ex, sessions, settings, gruppiUsati, onSetGroups, onBack, onRename, onDelete }) {
         const st = useMemo(() => exerciseStats(sessions, ex.id), [sessions, ex.id]);
         const [name, setName] = useState(ex.name);
         const totalVolume = st.points.reduce((n, p) => n + p.vol, 0);
@@ -3328,6 +3536,12 @@
                 onBlur={() => name.trim() && onRename(ex.id, name.trim())}
               />
             </Field>
+
+            <GroupField
+              value={groupsOf(ex)}
+              suggestions={gruppiUsati}
+              onChange={(g) => onSetGroups(ex.id, g)}
+            />
 
             <div style={{ display: "flex", gap: 10, marginTop: 22, marginBottom: 20 }}>
               <Stat label="Allenamenti" value={st.sessions} />
@@ -3862,6 +4076,7 @@
             <div style={sezioneTitolo}>Valori di base delle schede</div>
             <p style={sezioneTesto}>
               Quello che Gimmo propone quando aggiungi un esercizio a una scheda. Le schede già create non cambiano.
+              La preparazione è la pausa prima di un esercizio a tempo: una singola scheda può usarne una sua.
             </p>
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 28 }}>
               <SmallNum label="Serie" value={settings.defaultSets} onChange={(v) => onChange({ defaultSets: v })} />
@@ -3879,6 +4094,11 @@
                 label="Recupero (s)"
                 value={settings.defaultRest}
                 onChange={(v) => onChange({ defaultRest: v })}
+              />
+              <SmallNum
+                label="Preparazione (s)"
+                value={settings.prepSeconds}
+                onChange={(v) => onChange({ prepSeconds: v })}
               />
             </div>
 
